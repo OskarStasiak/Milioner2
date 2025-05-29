@@ -44,7 +44,7 @@ with open('cdp_api_key.json', 'r') as f:
     API_SECRET = api_keys['api_key_secret']
 
 # Parametry handlowe
-TRADING_PAIRS = ['ETH-USDC', 'BTC-USDC']  # Tylko te dwie pary są obsługiwane
+TRADING_PAIRS = ['ETH-USDC', 'BTC-USDC', 'ETH-USD', 'BTC-USD']  # Wszystkie obsługiwane pary
 TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 50))  # Zwiększona wartość pojedynczej transakcji
 MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 500))  # Zwiększona maksymalna ekspozycja całkowita
 MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', 100))  # Zwiększony maksymalny rozmiar pozycji
@@ -66,13 +66,15 @@ PROFIT_MULTIPLIER = 2.0  # Mnożnik do podwajania zysków
 
 # Parametry zarządzania kapitałem
 CAPITAL_ALLOCATION = {
-    'ETH-USDC': 0.5,  # 50% kapitału na ETH
-    'BTC-USDC': 0.5,  # 50% kapitału na BTC
-    'RESERVE': 0.0    # Brak rezerwy
+    'ETH-USDC': 0.25,  # 25% kapitału na ETH-USDC
+    'BTC-USDC': 0.25,  # 25% kapitału na BTC-USDC
+    'ETH-USD': 0.25,   # 25% kapitału na ETH-USD
+    'BTC-USD': 0.25,   # 25% kapitału na BTC-USD
+    'RESERVE': 0.0     # Brak rezerwy
 }
 
-MIN_TRADE_SIZE_USDC = 30  # Zwiększona minimalna wielkość zlecenia
-MAX_TRADES_PER_DAY = 10   # Zwiększona maksymalna liczba transakcji dziennie
+MIN_TRADE_SIZE_USDC = 10  # Zmniejszona minimalna wielkość zlecenia
+MAX_TRADES_PER_DAY = 20   # Zwiększona maksymalna liczba transakcji dziennie
 
 # Parametry zarządzania zyskami
 MIN_PROFIT_TARGET = 0.5  # Minimalny cel zysku w procentach
@@ -83,7 +85,9 @@ TREND_STRENGTH_MULTIPLIER = 1.5  # Mnożnik siły trendu do obliczania celu zysk
 # Minimalny rozmiar zlecenia dla każdej pary (możesz dostosować do wymagań giełdy)
 MIN_ORDER_SIZE_USDC = {
     'ETH-USDC': 10.0,
-    'BTC-USDC': 10.0
+    'BTC-USDC': 10.0,
+    'ETH-USD': 10.0,
+    'BTC-USD': 10.0
 }
 
 # Inicjalizacja API
@@ -102,9 +106,10 @@ for pair in TRADING_PAIRS:
         'price_history': [],
         'last_buy_price': None,
         'last_sell_price': None,
-        'trade_history': [],
+        'trade_history': [],  # Inicjalizacja pustej historii transakcji
         'highest_price': None
     }
+    logging.info(f"Inicjalizacja danych dla {pair} - historia transakcji wyczyszczona")
 
 def on_ws_message(data):
     """Obsługa wiadomości z WebSocket."""
@@ -184,12 +189,9 @@ def calculate_rsi(prices, period=14):
         if len(prices) < period:
             logging.warning(f"Za mało danych do obliczenia RSI (potrzeba {period}, jest {len(prices)})")
             return 50
-            
-        # Użyj bezpośrednio kolumny 'price' z DataFrame
-        price_series = prices['price']
         
         # Oblicz zmiany cen
-        delta = price_series.diff()
+        delta = prices.diff()
         
         # Oblicz zyski i straty
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
@@ -211,12 +213,9 @@ def calculate_macd(prices, fast=12, slow=26, signal=9):
             logging.warning(f"Za mało danych do obliczenia MACD (potrzeba {slow}, jest {len(prices)})")
             return None, None, None
         
-        # Użyj bezpośrednio kolumny 'price' z DataFrame
-        price_series = prices['price']
-        
         # Obliczanie EMA
-        ema_fast = price_series.ewm(span=fast, adjust=False).mean()
-        ema_slow = price_series.ewm(span=slow, adjust=False).mean()
+        ema_fast = prices.ewm(span=fast, adjust=False).mean()
+        ema_slow = prices.ewm(span=slow, adjust=False).mean()
         
         # Obliczanie MACD
         macd_line = ema_fast - ema_slow
@@ -235,12 +234,9 @@ def calculate_moving_averages(prices, short_period=20, long_period=50):
             logging.warning(f"Za mało danych do obliczenia średnich kroczących (potrzeba {long_period}, jest {len(prices)})")
             return None, None
         
-        # Użyj bezpośrednio kolumny 'price' z DataFrame
-        price_series = prices['price']
-        
         # Oblicz średnie kroczące
-        ma_short = price_series.rolling(window=short_period).mean().iloc[-1]
-        ma_long = price_series.rolling(window=long_period).mean().iloc[-1]
+        ma_short = prices.rolling(window=short_period).mean().iloc[-1]
+        ma_long = prices.rolling(window=long_period).mean().iloc[-1]
         
         return ma_short, ma_long
     except Exception as e:
@@ -262,6 +258,23 @@ def get_usdc_balance():
         return 0
     except Exception as e:
         logging.error(f"Błąd podczas pobierania salda USDC: {e}")
+        return 0
+
+def get_usd_balance():
+    """Pobierz saldo USD."""
+    try:
+        accounts = client.get_accounts().accounts
+        for account in accounts:
+            if account.currency == 'USD':
+                balance = account.available_balance
+                if balance:
+                    if isinstance(balance, dict):
+                        return float(balance.get('value', 0))
+                    else:
+                        return float(balance.value)
+        return 0
+    except Exception as e:
+        logging.error(f"Błąd podczas pobierania salda USD: {e}")
         return 0
 
 def get_crypto_balance(crypto_symbol):
@@ -528,18 +541,33 @@ def get_account_balance():
         logging.error(f"Błąd podczas pobierania stanu konta: {e}")
         raise
 
-def get_current_price(product_id):
-    """Pobierz aktualną cenę dla danej pary."""
+def get_product_ticker(product_id):
+    """Pobiera aktualną cenę dla danej pary."""
     try:
         # Sprawdź czy para jest na liście dostępnych par
         if product_id not in TRADING_PAIRS:
-            logging.warning(f"Para {product_id} nie jest na liście dostępnych par handlowych")
+            logger.warning(f"Para {product_id} nie jest na liście dostępnych par handlowych")
             return None
 
-        product = client.get_product(product_id)
-        return float(product.price)
+        # Sprawdź czy para istnieje na giełdzie
+        try:
+            product = client.get_product(product_id)
+            if not product:
+                logger.warning(f"Para {product_id} nie istnieje na giełdzie")
+                return None
+        except Exception as e:
+            logger.error(f"Błąd podczas sprawdzania pary {product_id}: {e}")
+            return None
+
+        # Pobierz ticker
+        ticker = client.get_product_ticker(product_id=product_id)
+        if not ticker:
+            logger.warning(f"Nie udało się pobrać aktualnej ceny dla {product_id}")
+            return None
+
+        return ticker
     except Exception as e:
-        logging.error(f"Błąd podczas pobierania aktualnej ceny dla {product_id}: {e}")
+        logger.error(f"Błąd podczas pobierania aktualnej ceny dla {product_id}: {e}")
         return None
 
 def check_total_exposure():
@@ -557,7 +585,7 @@ def check_total_exposure():
                         logging.debug(f"Para {pair} nie jest obsługiwana - pomijam")
                         continue
                         
-                    current_price = get_current_price(pair)
+                    current_price = get_product_ticker(pair)
                     if current_price is None:
                         logging.debug(f"Nie można pobrać ceny dla {pair} - pomijam")
                         continue
@@ -706,6 +734,14 @@ def can_trade_today(product_id):
     """Sprawdza czy można wykonać kolejną transakcję dzisiaj."""
     try:
         today = datetime.utcnow().date()
+        # Resetuj historię transakcji jeśli to nowy dzień
+        if market_data[product_id]['trade_history']:
+            last_trade_date = market_data[product_id]['trade_history'][-1]['timestamp'].date()
+            if last_trade_date < today:
+                market_data[product_id]['trade_history'] = []
+                logging.info(f"Reset historii transakcji dla {product_id} - nowy dzień")
+                save_trade_history()  # Zapisz zmiany
+        
         trades_today = sum(1 for trade in market_data[product_id]['trade_history'] 
                          if trade['timestamp'].date() == today)
         return trades_today < MAX_TRADES_PER_DAY
@@ -763,6 +799,7 @@ def place_buy_order(product_id, amount, price):
             'amount': crypto_amount,
             'timestamp': datetime.utcnow()
         })
+        save_trade_history()  # Zapisz zmiany po każdej transakcji
         logging.info(f"Złożono zlecenie kupna dla {product_id}: {order}")
         return order
     except Exception as e:
@@ -789,6 +826,7 @@ def place_sell_order(product_id, amount, price):
             'amount': amount,
             'timestamp': datetime.utcnow()
         })
+        save_trade_history()  # Zapisz zmiany po każdej transakcji
         logging.info(f"Złożono zlecenie sprzedaży dla {product_id}: {order}")
         return order
     except Exception as e:
@@ -881,7 +919,7 @@ def print_detailed_balances():
                     pair = f"{currency}-USDC"
                     if pair in TRADING_PAIRS:
                         try:
-                            current_price = get_current_price(pair)
+                            current_price = get_product_ticker(pair)
                             if current_price is not None:
                                 value_usdc = total * current_price
                                 total_value_usdc += value_usdc
@@ -969,72 +1007,128 @@ def get_transaction_history(product_id):
 def get_authenticated_client():
     """Tworzy i zwraca uwierzytelnionego klienta Coinbase."""
     try:
-        client = RESTClient()
+        # Wczytaj klucze API z pliku
+        with open('cdp_api_key.json', 'r') as f:
+            api_keys = json.load(f)
+            api_key = api_keys['api_key_id']
+            api_secret = api_keys['api_key_secret']
+        
+        # Utwórz klienta z kluczami API
+        client = RESTClient(api_key=api_key, api_secret=api_secret)
         return client
     except Exception as e:
         logger.error(f"Błąd podczas tworzenia klienta: {str(e)}")
         return None
 
+def save_trade_history():
+    """Zapisuje historię transakcji do pliku."""
+    try:
+        with open('trade_history.json', 'w') as f:
+            json.dump(market_data, f, default=str)
+        logging.info("Zapisano historię transakcji")
+    except Exception as e:
+        logging.error(f"Błąd podczas zapisywania historii transakcji: {e}")
+
+def load_trade_history():
+    """Wczytuje historię transakcji z pliku."""
+    try:
+        if os.path.exists('trade_history.json'):
+            with open('trade_history.json', 'r') as f:
+                data = json.load(f)
+                for pair in TRADING_PAIRS:
+                    if pair in data:
+                        market_data[pair]['trade_history'] = data[pair]['trade_history']
+                        # Konwertuj stringi timestampów z powrotem na obiekty datetime
+                        for trade in market_data[pair]['trade_history']:
+                            trade['timestamp'] = datetime.fromisoformat(trade['timestamp'])
+            logging.info("Wczytano historię transakcji")
+    except Exception as e:
+        logging.error(f"Błąd podczas wczytywania historii transakcji: {e}")
+
 def main():
     """Główna funkcja bota"""
     try:
         # Inicjalizacja klienta
+        global client
         client = get_authenticated_client()
         if not client:
             logger.error("Nie udało się zainicjalizować klienta")
             return
 
+        logger.info("=== ROZPOCZYNAM DZIAŁANIE BOTA ===")
+        logger.info("Sprawdzam dostępność par handlowych...")
+        
+        # Sprawdź dostępność par handlowych
+        for pair in TRADING_PAIRS:
+            try:
+                product = client.get_product(pair)
+                if product:
+                    logger.info(f"Para {pair} jest dostępna")
+                else:
+                    logger.error(f"Para {pair} nie jest dostępna")
+                    return
+            except Exception as e:
+                logger.error(f"Błąd podczas sprawdzania pary {pair}: {e}")
+                return
+
+        # Wczytaj historię transakcji
+        load_trade_history()
+        logger.info("Historia transakcji wczytana")
+
         # Inicjalizacja WebSocket
         ws.connect()
         time.sleep(2)  # Czekamy na połączenie
+        logger.info("WebSocket połączony")
 
-        # Subskrybujemy się do kanałów tylko raz
+        # Subskrybujemy się do kanałów
         for pair in TRADING_PAIRS:
             try:
                 ws.subscribe_to_ticker(pair)
-                time.sleep(0.5)  # Dodajemy opóźnienie między subskrypcjami
+                time.sleep(0.5)
                 ws.subscribe_to_level2(pair)
                 time.sleep(0.5)
                 ws.subscribe_to_market_trades(pair)
                 time.sleep(0.5)
+                logger.info(f"Subskrybowano do kanałów dla {pair}")
             except Exception as e:
                 logger.error(f"Błąd podczas subskrybowania do kanałów dla {pair}: {str(e)}")
                 continue
 
-        # Główna pętla
+        logger.info("=== ROZPOCZYNAM GŁÓWNĄ PĘTLĘ HANDLOWĄ ===")
+        
         while True:
             try:
+                logger.info("\n=== NOWA ITERACJA PĘTLI HANDLOWEJ ===")
+                
                 # Sprawdzamy stan połączenia
                 if not ws.is_connected():
                     logger.warning("Utracono połączenie WebSocket, próba ponownego połączenia...")
                     ws.connect()
-                    time.sleep(2)  # Czekamy na połączenie
+                    time.sleep(2)
                     continue
 
                 # Sprawdzamy salda
-                accounts = client.get_accounts()
-                usdc_balance = 0.0
-                btc_balance = 0.0
-                eth_balance = 0.0
+                usdc_balance = get_usdc_balance()
+                usd_balance = get_usd_balance()
+                btc_balance = get_crypto_balance('BTC')
+                eth_balance = get_crypto_balance('ETH')
 
-                for account in accounts:
-                    if account.currency == 'USDC':
-                        usdc_balance = float(account.available_balance.value)
-                    elif account.currency == 'BTC':
-                        btc_balance = float(account.available_balance.value)
-                    elif account.currency == 'ETH':
-                        eth_balance = float(account.available_balance.value)
-
-                logger.info(f"Saldo USDC: {usdc_balance}")
-                logger.info(f"Saldo BTC: {btc_balance}")
-                logger.info(f"Saldo ETH: {eth_balance}")
+                logger.info(f"\n=== AKTUALNE SALDA ===")
+                logger.info(f"USDC: {usdc_balance}")
+                logger.info(f"USD: {usd_balance}")
+                logger.info(f"BTC: {btc_balance}")
+                logger.info(f"ETH: {eth_balance}")
 
                 # Sprawdzamy każdą parę
                 for pair in TRADING_PAIRS:
                     try:
+                        logger.info(f"\n=== ANALIZA PARY {pair} ===")
+                        
                         # Pobieramy świeczki
                         end_time = datetime.now()
                         start_time = end_time - timedelta(days=3)
+                        logger.info(f"Pobieram świeczki dla {pair} od {start_time} do {end_time}")
+                        
                         candles = client.get_product_candles(
                             product_id=pair,
                             start=start_time,
@@ -1045,6 +1139,8 @@ def main():
                         if not candles:
                             logger.warning(f"Brak danych świeczek dla {pair}")
                             continue
+
+                        logger.info(f"Otrzymano {len(candles)} świeczek dla {pair}")
 
                         # Konwertujemy dane
                         df = pd.DataFrame([{
@@ -1059,11 +1155,11 @@ def main():
                         df['macd'] = macd
                         df['signal'] = signal
                         df['hist'] = hist
-                        df['ma20'] = calculate_ma(df['price'], 20)
-                        df['ma50'] = calculate_ma(df['price'], 50)
+                        df['ma20'] = calculate_moving_averages(df['price'])[0]
+                        df['ma50'] = calculate_moving_averages(df['price'])[1]
 
                         # Pobieramy aktualną cenę
-                        ticker = client.get_product_ticker(product_id=pair)
+                        ticker = get_product_ticker(pair)
                         if not ticker:
                             logger.warning(f"Nie udało się pobrać aktualnej ceny dla {pair}")
                             continue
@@ -1073,47 +1169,91 @@ def main():
 
                         # Sprawdzamy sygnały
                         last_row = df.iloc[-1]
+                        logger.info(f"\n=== WSKAŹNIKI TECHNICZNE DLA {pair} ===")
                         logger.info(f"RSI: {last_row['rsi']:.2f}")
-                        logger.info(f"MACD: {last_row['macd']:.2f}, Signal: {last_row['signal']:.2f}, Hist: {last_row['hist']:.2f}")
-                        logger.info(f"MA20: {last_row['ma20']:.2f}, MA50: {last_row['ma50']:.2f}")
+                        logger.info(f"MACD: {last_row['macd']:.2f}")
+                        logger.info(f"Signal: {last_row['signal']:.2f}")
+                        logger.info(f"Histogram: {last_row['hist']:.2f}")
+                        logger.info(f"MA20: {last_row['ma20']:.2f}")
+                        logger.info(f"MA50: {last_row['ma50']:.2f}")
 
                         # Obliczamy zmienność ceny
                         price_change = (current_price - df['price'].iloc[-2]) / df['price'].iloc[-2] * 100
                         logger.info(f"Zmienność ceny: {price_change:.2f}%")
 
                         # Sprawdzamy warunki handlowe
-                        if pair == 'BTC-USDC':
+                        if pair in ['BTC-USDC', 'BTC-USD']:
                             if btc_balance > 0:
-                                if (last_row['rsi'] > 70 or 
+                                logger.info(f"\n=== SPRAWDZANIE WARUNKÓW SPRZEDAŻY BTC ===")
+                                logger.info(f"RSI > 60: {last_row['rsi'] > 60}")
+                                logger.info(f"MACD < Signal: {last_row['macd'] < last_row['signal']}")
+                                logger.info(f"Histogram < 0: {last_row['hist'] < 0}")
+                                logger.info(f"Cena < MA20: {current_price < last_row['ma20']}")
+                                
+                                if (last_row['rsi'] > 60 or 
                                     (last_row['macd'] < last_row['signal'] and last_row['hist'] < 0) or
                                     current_price < last_row['ma20']):
-                                    logger.info("SILNY SYGNAŁ SPRZEDAŻY - Realizacja zysku lub ograniczenie straty")
-                                    place_sell_order(client, pair, btc_balance)
-                        else:  # ETH-USDC
-                            if usdc_balance >= MIN_TRADE_SIZE_USDC:
-                                if (last_row['rsi'] < 30 or 
-                                    (last_row['macd'] > last_row['signal'] and last_row['hist'] > 0) or
+                                    logger.info("!!! SYGNAŁ SPRZEDAŻY - PRÓBA REALIZACJI ZYSKU !!!")
+                                    try:
+                                        order = place_sell_order(pair, btc_balance, current_price)
+                                        logger.info(f"Złożono zlecenie sprzedaży: {order}")
+                                    except Exception as e:
+                                        logger.error(f"Błąd podczas składania zlecenia sprzedaży: {e}")
+                        else:  # ETH-USDC lub ETH-USD
+                            if pair == 'ETH-USDC' and usdc_balance >= MIN_TRADE_SIZE_USDC:
+                                logger.info(f"\n=== SPRAWDZANIE WARUNKÓW KUPNA ETH ZA USDC ===")
+                                logger.info(f"RSI < 50: {last_row['rsi'] < 50}")
+                                logger.info(f"MACD > Signal: {last_row['macd'] > last_row['signal']}")
+                                logger.info(f"Histogram > 0: {last_row['hist'] > 0}")
+                                logger.info(f"Cena > MA20: {current_price > last_row['ma20']}")
+                                
+                                if (last_row['rsi'] < 50 or 
+                                    last_row['macd'] > last_row['signal'] or 
+                                    last_row['hist'] > 0 or 
                                     current_price > last_row['ma20']):
-                                    logger.info("SILNY SYGNAŁ KUPNA - Wejście w pozycję")
-                                    place_buy_order(client, pair, usdc_balance)
+                                    logger.info("!!! SYGNAŁ KUPNA - PRÓBA WEJŚCIA W POZYCJĘ !!!")
+                                    try:
+                                        order = place_buy_order(pair, usdc_balance, current_price)
+                                        logger.info(f"Złożono zlecenie kupna: {order}")
+                                    except Exception as e:
+                                        logger.error(f"Błąd podczas składania zlecenia kupna: {e}")
+                            elif pair == 'ETH-USD' and usd_balance >= MIN_TRADE_SIZE_USDC:
+                                logger.info(f"\n=== SPRAWDZANIE WARUNKÓW KUPNA ETH ZA USD ===")
+                                logger.info(f"RSI < 50: {last_row['rsi'] < 50}")
+                                logger.info(f"MACD > Signal: {last_row['macd'] > last_row['signal']}")
+                                logger.info(f"Histogram > 0: {last_row['hist'] > 0}")
+                                logger.info(f"Cena > MA20: {current_price > last_row['ma20']}")
+                                
+                                if (last_row['rsi'] < 50 or 
+                                    last_row['macd'] > last_row['signal'] or 
+                                    last_row['hist'] > 0 or 
+                                    current_price > last_row['ma20']):
+                                    logger.info("!!! SYGNAŁ KUPNA - PRÓBA WEJŚCIA W POZYCJĘ !!!")
+                                    try:
+                                        order = place_buy_order(pair, usd_balance, current_price)
+                                        logger.info(f"Złożono zlecenie kupna: {order}")
+                                    except Exception as e:
+                                        logger.error(f"Błąd podczas składania zlecenia kupna: {e}")
 
                     except Exception as e:
                         logger.error(f"Błąd podczas przetwarzania pary {pair}: {str(e)}")
                         continue
 
-                time.sleep(60)  # Czekamy minutę przed następnym sprawdzeniem
+                logger.info("\n=== CZEKAM 60 SEKUND PRZED NASTĘPNĄ ITERACJĄ ===")
+                time.sleep(60)
 
             except Exception as e:
                 logger.error(f"Błąd w głównej pętli: {str(e)}")
-                time.sleep(60)  # W przypadku błędu czekamy minutę przed ponowną próbą
+                time.sleep(60)
 
     except KeyboardInterrupt:
         logger.info("Zatrzymywanie bota...")
+        ws.disconnect()
+        save_trade_history()
     except Exception as e:
-        logger.error(f"Nieoczekiwany błąd: {str(e)}")
-    finally:
-        if 'ws' in locals():
-            ws.close()
+        logger.error(f"Krytyczny błąd: {str(e)}")
+        ws.disconnect()
+        save_trade_history()
 
 if __name__ == "__main__":
     print_detailed_balances()
