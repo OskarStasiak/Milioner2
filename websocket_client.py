@@ -25,11 +25,13 @@ class CoinbaseWebSocket:
         self.trading_pairs = trading_pairs
         self.ws = None
         self.connected = False
-        self.last_message_time = None
-        self.message_count = 0
+        self.subscribed_channels = set()  # Zbiór subskrybowanych kanałów
+        self.last_reconnect_time = 0
         self.reconnect_attempts = 0
         self.max_reconnect_attempts = 5
-        self.reconnect_delay = 5  # sekundy
+        self.min_reconnect_delay = 30  # Minimalne opóźnienie między próbami połączenia (sekundy)
+        self.last_message_time = None
+        self.message_count = 0
         self.last_ping = None
         self.last_pong = None
         
@@ -183,11 +185,14 @@ class CoinbaseWebSocket:
         """Obsługa błędów WebSocket."""
         logging.error(f"Błąd WebSocket: {error}")
         self.connected = False
+        self.last_reconnect_time = time.time()
+        self.reconnect_attempts += 1
     
     def on_close(self, ws, close_status_code, close_msg):
         """Obsługa zamknięcia połączenia WebSocket."""
         logging.info(f"Zamknięto połączenie WebSocket: {close_status_code} - {close_msg}")
         self.connected = False
+        self.subscribed_channels.clear()
         self._attempt_reconnect()
     
     def on_open(self, ws):
@@ -223,7 +228,7 @@ class CoinbaseWebSocket:
         if self.reconnect_attempts < self.max_reconnect_attempts:
             self.reconnect_attempts += 1
             logging.info(f"Próba ponownego połączenia {self.reconnect_attempts}/{self.max_reconnect_attempts}")
-            time.sleep(self.reconnect_delay)
+            time.sleep(self.min_reconnect_delay)
             self.connect()
         else:
             logging.error("Przekroczono maksymalną liczbę prób ponownego połączenia")
@@ -231,6 +236,15 @@ class CoinbaseWebSocket:
     def connect(self):
         """Nawiązuje połączenie WebSocket."""
         try:
+            current_time = time.time()
+            if current_time - self.last_reconnect_time < self.min_reconnect_delay:
+                logging.warning(f"Zbyt wcześnie na kolejną próbę połączenia. Czekaj {self.min_reconnect_delay} sekund.")
+                return False
+
+            if self.reconnect_attempts >= self.max_reconnect_attempts:
+                logging.error("Przekroczono maksymalną liczbę prób połączenia.")
+                return False
+
             if self.ws:
                 self.ws.close()
                 
@@ -254,9 +268,16 @@ class CoinbaseWebSocket:
             if not self.connected:
                 raise Exception("Timeout podczas nawiązywania połączenia WebSocket")
                 
+            self.reconnect_attempts = 0
+            self.last_reconnect_time = time.time()
+            self.subscribed_channels.clear()
+            self._subscribe_to_channels()
+            
+            return True
+                
         except Exception as e:
             logging.error(f"Błąd podczas nawiązywania połączenia WebSocket: {e}")
-            raise
+            return False
     
     def disconnect(self):
         """Rozłącz połączenie WebSocket."""
@@ -306,6 +327,85 @@ class CoinbaseWebSocket:
         except Exception as e:
             logging.error(f"Błąd podczas subskrybowania do kanałów dla {product_id}: {e}")
             raise
+
+    def is_connected(self):
+        """Sprawdza czy połączenie jest aktywne."""
+        return self.connected and self.ws and self.ws.sock and self.ws.sock.connected
+
+    def subscribe_to_ticker(self, product_id):
+        """Subskrybuje do kanału ticker dla danej pary."""
+        if not self.is_connected():
+            logging.error("Brak połączenia WebSocket")
+            return False
+
+        channel = f"ticker-{product_id}"
+        if channel in self.subscribed_channels:
+            logging.info(f"Już subskrybowano do kanału {channel}")
+            return True
+
+        try:
+            subscribe_message = {
+                "type": "subscribe",
+                "product_ids": [product_id],
+                "channels": ["ticker"]
+            }
+            self.ws.send(json.dumps(subscribe_message))
+            self.subscribed_channels.add(channel)
+            logging.info(f"Subskrybowano do kanału ticker dla {product_id}")
+            return True
+        except Exception as e:
+            logging.error(f"Błąd podczas subskrybowania do kanału ticker: {str(e)}")
+            return False
+
+    def subscribe_to_level2(self, product_id):
+        """Subskrybuje do kanału level2 dla danej pary."""
+        if not self.is_connected():
+            logging.error("Brak połączenia WebSocket")
+            return False
+
+        channel = f"level2-{product_id}"
+        if channel in self.subscribed_channels:
+            logging.info(f"Już subskrybowano do kanału {channel}")
+            return True
+
+        try:
+            subscribe_message = {
+                "type": "subscribe",
+                "product_ids": [product_id],
+                "channels": ["level2"]
+            }
+            self.ws.send(json.dumps(subscribe_message))
+            self.subscribed_channels.add(channel)
+            logging.info(f"Subskrybowano do kanału level2 dla {product_id}")
+            return True
+        except Exception as e:
+            logging.error(f"Błąd podczas subskrybowania do kanału level2: {str(e)}")
+            return False
+
+    def subscribe_to_market_trades(self, product_id):
+        """Subskrybuje do kanału market_trades dla danej pary."""
+        if not self.is_connected():
+            logging.error("Brak połączenia WebSocket")
+            return False
+
+        channel = f"market_trades-{product_id}"
+        if channel in self.subscribed_channels:
+            logging.info(f"Już subskrybowano do kanału {channel}")
+            return True
+
+        try:
+            subscribe_message = {
+                "type": "subscribe",
+                "product_ids": [product_id],
+                "channels": ["matches"]
+            }
+            self.ws.send(json.dumps(subscribe_message))
+            self.subscribed_channels.add(channel)
+            logging.info(f"Subskrybowano do kanału market_trades dla {product_id}")
+            return True
+        except Exception as e:
+            logging.error(f"Błąd podczas subskrybowania do kanału market_trades: {str(e)}")
+            return False
 
 if __name__ == "__main__":
     # Przykład użycia

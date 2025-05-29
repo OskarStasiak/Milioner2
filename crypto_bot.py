@@ -10,13 +10,29 @@ import numpy as np
 from sklearn.preprocessing import MinMaxScaler
 import tensorflow as tf
 from websocket_client import CoinbaseWebSocket
+import threading
+import websocket
 
-# Konfiguracja logowania
-logging.basicConfig(
-    filename='crypto_bot.log',
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+# Konfiguracja loggera
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+
+# Dodaj handler do pliku
+file_handler = logging.FileHandler('crypto_bot.log')
+file_handler.setLevel(logging.INFO)
+
+# Dodaj handler do konsoli
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Format logów
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Dodaj handlery do loggera
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
 
 # Załaduj zmienne środowiskowe
 load_dotenv('production.env')
@@ -29,17 +45,17 @@ with open('cdp_api_key.json', 'r') as f:
 
 # Parametry handlowe
 TRADING_PAIRS = ['ETH-USDC', 'BTC-USDC']  # Tylko te dwie pary są obsługiwane
-TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 30))  # Zmniejszona wartość pojedynczej transakcji
-MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 300))  # Maksymalna ekspozycja całkowita
-MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', 50))  # Zmniejszony maksymalny rozmiar pozycji
-PRICE_THRESHOLD_BUY = float(os.getenv('PRICE_THRESHOLD_BUY', 1500))
+TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 50))  # Zwiększona wartość pojedynczej transakcji
+MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 500))  # Zwiększona maksymalna ekspozycja całkowita
+MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', 100))  # Zwiększony maksymalny rozmiar pozycji
+PRICE_THRESHOLD_BUY = float(os.getenv('PRICE_THRESHOLD_BUY', 3500))
 PRICE_THRESHOLD_SELL = float(os.getenv('PRICE_THRESHOLD_SELL', 4000))
 MIN_PROFIT_PERCENT = float(os.getenv('MIN_PROFIT_PERCENT', 0.3))
 MAX_LOSS_PERCENT = float(os.getenv('MAX_LOSS_PERCENT', 0.5))
 
 # Nowe parametry dla stop-loss i take-profit
 STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', 2.0))  # Stop-loss na -2%
-TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', 3.0))  # Take-profit na +3%
+TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', 2.0))  # Take-profit na +2%
 TRAILING_STOP_PERCENT = float(os.getenv('TRAILING_STOP_PERCENT', 1.0))  # Trailing stop 1%
 
 # Parametry podwajania zysków
@@ -50,13 +66,13 @@ PROFIT_MULTIPLIER = 2.0  # Mnożnik do podwajania zysków
 
 # Parametry zarządzania kapitałem
 CAPITAL_ALLOCATION = {
-    'ETH-USDC': 0.4,  # 40% kapitału na ETH
-    'BTC-USDC': 0.4,  # 40% kapitału na BTC
-    'RESERVE': 0.2    # 20% kapitału jako rezerwa
+    'ETH-USDC': 0.5,  # 50% kapitału na ETH
+    'BTC-USDC': 0.5,  # 50% kapitału na BTC
+    'RESERVE': 0.0    # Brak rezerwy
 }
 
-MIN_TRADE_SIZE_USDC = 20  # Minimalna wielkość zlecenia
-MAX_TRADES_PER_DAY = 5    # Maksymalna liczba transakcji dziennie
+MIN_TRADE_SIZE_USDC = 30  # Zwiększona minimalna wielkość zlecenia
+MAX_TRADES_PER_DAY = 10   # Zwiększona maksymalna liczba transakcji dziennie
 
 # Parametry zarządzania zyskami
 MIN_PROFIT_TARGET = 0.5  # Minimalny cel zysku w procentach
@@ -64,11 +80,17 @@ MAX_PROFIT_TARGET = 5.0  # Maksymalny cel zysku w procentach
 VOLATILITY_MULTIPLIER = 2.0  # Mnożnik zmienności do obliczania celu zysku
 TREND_STRENGTH_MULTIPLIER = 1.5  # Mnożnik siły trendu do obliczania celu zysku
 
+# Minimalny rozmiar zlecenia dla każdej pary (możesz dostosować do wymagań giełdy)
+MIN_ORDER_SIZE_USDC = {
+    'ETH-USDC': 10.0,
+    'BTC-USDC': 10.0
+}
+
 # Inicjalizacja API
 client = RESTClient(api_key=API_KEY, api_secret=API_SECRET)
 
 # Inicjalizacja WebSocket dla wszystkich par
-ws_client = CoinbaseWebSocket(API_KEY, API_SECRET, TRADING_PAIRS)
+ws = CoinbaseWebSocket(API_KEY, API_SECRET, TRADING_PAIRS)
 
 # Globalne zmienne do przechowywania danych w czasie rzeczywistym
 market_data = {}
@@ -695,14 +717,15 @@ def calculate_trade_size(product_id, current_price):
     """Oblicza optymalną wielkość zlecenia."""
     try:
         available_capital = get_available_capital_for_pair(product_id)
-        if available_capital < MIN_TRADE_SIZE_USDC:
+        min_size = MIN_ORDER_SIZE_USDC.get(product_id, 10.0)
+        if available_capital < min_size:
+            logging.info(f"Za mało kapitału na zlecenie dla {product_id} (min: {min_size} USDC)")
             return 0
-            
-        # Oblicz wielkość zlecenia jako 20% dostępnego kapitału
-        trade_size = min(available_capital * 0.2, MAX_POSITION_SIZE)
+        # Oblicz wielkość zlecenia jako 20% dostępnego kapitału, ale nie mniej niż min_size i nie więcej niż MAX_POSITION_SIZE
+        trade_size = max(min_size, min(available_capital * 0.2, MAX_POSITION_SIZE))
         amount = trade_size / current_price
-        
-        return amount
+        logging.info(f"Obliczona wielkość zlecenia dla {product_id}: {trade_size} USDC ({amount} {product_id.split('-')[0]})")
+        return trade_size
     except Exception as e:
         logging.error(f"Błąd podczas obliczania wielkości zlecenia: {e}")
         return 0
@@ -710,43 +733,36 @@ def calculate_trade_size(product_id, current_price):
 def place_buy_order(product_id, amount, price):
     """Złóż zlecenie kupna dla danej pary."""
     try:
-        # Sprawdź całkowitą ekspozycję
         if not can_open_new_position():
             logging.info("Nie można otworzyć nowej pozycji - przekroczono maksymalną ekspozycję")
             return None
-            
-        # Sprawdź limity dzienne
         if not can_trade_today(product_id):
             logging.info(f"Osiągnięto dzienny limit transakcji dla {product_id}")
             return None
-            
-        # Oblicz optymalną wielkość zlecenia
-        amount = calculate_trade_size(product_id, price)
-        if amount == 0:
+        trade_size = calculate_trade_size(product_id, price)
+        if trade_size == 0:
             logging.info(f"Za mało kapitału na zlecenie dla {product_id}")
             return None
-        
+        crypto_amount = trade_size / price
+        logging.info(f"Próba złożenia zlecenia kupna dla {product_id}: {crypto_amount} {product_id.split('-')[0]} (wartość: {trade_size} USDC)")
         order = client.create_order(
             client_order_id=str(int(time.time() * 1000)),
             product_id=product_id,
             side="BUY",
             order_configuration={
                 "market_market_ioc": {
-                    "quote_size": str(amount * price)
+                    "quote_size": str(trade_size)
                 }
             }
         )
-        
-        # Zapisz informacje o transakcji
         market_data[product_id]['last_buy_price'] = price
         market_data[product_id]['highest_price'] = price
         market_data[product_id]['trade_history'].append({
             'type': 'buy',
             'price': price,
-            'amount': amount,
+            'amount': crypto_amount,
             'timestamp': datetime.utcnow()
         })
-        
         logging.info(f"Złożono zlecenie kupna dla {product_id}: {order}")
         return order
     except Exception as e:
@@ -950,86 +966,154 @@ def get_transaction_history(product_id):
     except Exception as e:
         print(f"Błąd podczas pobierania historii transakcji dla {product_id}: {e}")
 
-def main():
-    """Główna funkcja bota."""
+def get_authenticated_client():
+    """Tworzy i zwraca uwierzytelnionego klienta Coinbase."""
     try:
-        logging.info("Uruchamianie bota z wieloma parami handlowymi...")
-        
+        client = RESTClient()
+        return client
+    except Exception as e:
+        logger.error(f"Błąd podczas tworzenia klienta: {str(e)}")
+        return None
+
+def main():
+    """Główna funkcja bota"""
+    try:
+        # Inicjalizacja klienta
+        client = get_authenticated_client()
+        if not client:
+            logger.error("Nie udało się zainicjalizować klienta")
+            return
+
         # Inicjalizacja WebSocket
-        ws_client.connect()
-        
-        # Poczekaj na połączenie WebSocket
-        time.sleep(2)
-        
-        # Subskrybuj do kanałów
-        for product_id in TRADING_PAIRS:
-            ws_client.subscribe_to_channels(product_id)
-            # Inicjalizuj cele zysku dla każdej pary
-            market_data[product_id]['profit_target'] = INITIAL_PROFIT_TARGET
-        
+        ws.connect()
+        time.sleep(2)  # Czekamy na połączenie
+
+        # Subskrybujemy się do kanałów tylko raz
+        for pair in TRADING_PAIRS:
+            try:
+                ws.subscribe_to_ticker(pair)
+                time.sleep(0.5)  # Dodajemy opóźnienie między subskrypcjami
+                ws.subscribe_to_level2(pair)
+                time.sleep(0.5)
+                ws.subscribe_to_market_trades(pair)
+                time.sleep(0.5)
+            except Exception as e:
+                logger.error(f"Błąd podczas subskrybowania do kanałów dla {pair}: {str(e)}")
+                continue
+
+        # Główna pętla
         while True:
             try:
-                # Sprawdź stan połączenia
-                if not ws_client.connected:
-                    logging.warning("Brak połączenia WebSocket, próba ponownego połączenia...")
-                    ws_client.connect()
-                    time.sleep(5)
+                # Sprawdzamy stan połączenia
+                if not ws.is_connected():
+                    logger.warning("Utracono połączenie WebSocket, próba ponownego połączenia...")
+                    ws.connect()
+                    time.sleep(2)  # Czekamy na połączenie
                     continue
-                
-                # Pobierz dane dla każdej pary handlowej
-                for product_id in TRADING_PAIRS:
+
+                # Sprawdzamy salda
+                accounts = client.get_accounts()
+                usdc_balance = 0.0
+                btc_balance = 0.0
+                eth_balance = 0.0
+
+                for account in accounts:
+                    if account.currency == 'USDC':
+                        usdc_balance = float(account.available_balance.value)
+                    elif account.currency == 'BTC':
+                        btc_balance = float(account.available_balance.value)
+                    elif account.currency == 'ETH':
+                        eth_balance = float(account.available_balance.value)
+
+                logger.info(f"Saldo USDC: {usdc_balance}")
+                logger.info(f"Saldo BTC: {btc_balance}")
+                logger.info(f"Saldo ETH: {eth_balance}")
+
+                # Sprawdzamy każdą parę
+                for pair in TRADING_PAIRS:
                     try:
-                        # Pobierz aktualną cenę
-                        current_price = get_current_price(product_id)
-                        if current_price:
-                            market_data[product_id]['current_price'] = current_price
-                            logging.info(f"Aktualna cena {product_id}: {current_price}")
-                            
-                            # Sprawdź stop-loss i take-profit
-                            if check_stop_loss_take_profit(product_id, current_price):
-                                crypto_symbol = product_id.split('-')[0]
-                                crypto_balance = get_crypto_balance(crypto_symbol)
-                                if crypto_balance > 0:
-                                    place_sell_order(product_id, crypto_balance, current_price)
-                                    continue
-                            
-                            # Pobierz dane historyczne
-                            historical_data = get_historical_data(product_id)
-                            if historical_data is not None:
-                                market_data[product_id]['price_history'] = historical_data
-                                
-                                # Analiza techniczna i podejmowanie decyzji handlowych
-                                if should_trade(current_price, historical_data):
-                                    # Pobierz saldo konta
-                                    usdc_balance = get_usdc_balance()
-                                    crypto_symbol = product_id.split('-')[0]
-                                    crypto_balance = get_crypto_balance(crypto_symbol)
-                                    
-                                    logging.info(f"Saldo USDC: {usdc_balance}")
-                                    logging.info(f"Saldo {crypto_symbol}: {crypto_balance}")
-                                    
-                                    # Podejmij decyzję handlową
-                                    if current_price <= PRICE_THRESHOLD_BUY and usdc_balance >= MIN_TRADE_SIZE_USDC:
-                                        amount = calculate_trade_size(product_id, current_price)
-                                        if amount > 0:
-                                            place_buy_order(product_id, amount, current_price)
-                                    elif current_price >= PRICE_THRESHOLD_SELL and crypto_balance > 0:
-                                        place_sell_order(product_id, crypto_balance, current_price)
-                    
+                        # Pobieramy świeczki
+                        end_time = datetime.now()
+                        start_time = end_time - timedelta(days=3)
+                        candles = client.get_product_candles(
+                            product_id=pair,
+                            start=start_time,
+                            end=end_time,
+                            granularity='ONE_HOUR'
+                        )
+
+                        if not candles:
+                            logger.warning(f"Brak danych świeczek dla {pair}")
+                            continue
+
+                        # Konwertujemy dane
+                        df = pd.DataFrame([{
+                            'timestamp': candle.start,
+                            'price': float(candle.close),
+                            'size': float(candle.volume)
+                        } for candle in candles])
+
+                        # Obliczamy wskaźniki
+                        df['rsi'] = calculate_rsi(df['price'])
+                        macd, signal, hist = calculate_macd(df['price'])
+                        df['macd'] = macd
+                        df['signal'] = signal
+                        df['hist'] = hist
+                        df['ma20'] = calculate_ma(df['price'], 20)
+                        df['ma50'] = calculate_ma(df['price'], 50)
+
+                        # Pobieramy aktualną cenę
+                        ticker = client.get_product_ticker(product_id=pair)
+                        if not ticker:
+                            logger.warning(f"Nie udało się pobrać aktualnej ceny dla {pair}")
+                            continue
+
+                        current_price = float(ticker.price)
+                        logger.info(f"Aktualna cena {pair}: {current_price}")
+
+                        # Sprawdzamy sygnały
+                        last_row = df.iloc[-1]
+                        logger.info(f"RSI: {last_row['rsi']:.2f}")
+                        logger.info(f"MACD: {last_row['macd']:.2f}, Signal: {last_row['signal']:.2f}, Hist: {last_row['hist']:.2f}")
+                        logger.info(f"MA20: {last_row['ma20']:.2f}, MA50: {last_row['ma50']:.2f}")
+
+                        # Obliczamy zmienność ceny
+                        price_change = (current_price - df['price'].iloc[-2]) / df['price'].iloc[-2] * 100
+                        logger.info(f"Zmienność ceny: {price_change:.2f}%")
+
+                        # Sprawdzamy warunki handlowe
+                        if pair == 'BTC-USDC':
+                            if btc_balance > 0:
+                                if (last_row['rsi'] > 70 or 
+                                    (last_row['macd'] < last_row['signal'] and last_row['hist'] < 0) or
+                                    current_price < last_row['ma20']):
+                                    logger.info("SILNY SYGNAŁ SPRZEDAŻY - Realizacja zysku lub ograniczenie straty")
+                                    place_sell_order(client, pair, btc_balance)
+                        else:  # ETH-USDC
+                            if usdc_balance >= MIN_TRADE_SIZE_USDC:
+                                if (last_row['rsi'] < 30 or 
+                                    (last_row['macd'] > last_row['signal'] and last_row['hist'] > 0) or
+                                    current_price > last_row['ma20']):
+                                    logger.info("SILNY SYGNAŁ KUPNA - Wejście w pozycję")
+                                    place_buy_order(client, pair, usdc_balance)
+
                     except Exception as e:
-                        logging.error(f"Błąd podczas przetwarzania pary {product_id}: {e}")
+                        logger.error(f"Błąd podczas przetwarzania pary {pair}: {str(e)}")
                         continue
-                
-                # Poczekaj przed następną iteracją
-                time.sleep(5)
-                
+
+                time.sleep(60)  # Czekamy minutę przed następnym sprawdzeniem
+
             except Exception as e:
-                logging.error(f"Błąd w głównej pętli: {e}")
-                time.sleep(5)
-                
+                logger.error(f"Błąd w głównej pętli: {str(e)}")
+                time.sleep(60)  # W przypadku błędu czekamy minutę przed ponowną próbą
+
     except KeyboardInterrupt:
-        logging.info("Zatrzymywanie bota...")
-        ws_client.disconnect()
+        logger.info("Zatrzymywanie bota...")
+    except Exception as e:
+        logger.error(f"Nieoczekiwany błąd: {str(e)}")
+    finally:
+        if 'ws' in locals():
+            ws.close()
 
 if __name__ == "__main__":
     print_detailed_balances()
