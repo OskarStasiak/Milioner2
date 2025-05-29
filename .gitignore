@@ -1,0 +1,27 @@
+# Pliki z kluczami API
+cdp_api_key.json
+*.env
+
+# Logi
+*.log
+bot_output.log
+
+# Pliki Pythona
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Środowisko wirtualne
+venv/
+env/
+.env/
+
+# Pliki systemowe
+.DS_Store
+Thumbs.db
+
+# Ignoruj pliki z kluczami (np. cdp_api_key.json, account_ids.txt)
+account_ids.txt
+
+# Ignoruj pliki środowiskowe (np. production.env, .env)
+production.env 

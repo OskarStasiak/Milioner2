@@ -1,0 +1,10 @@
+{
+    "timestamp": "2025-05-21T17:53:37.049767",
+    "API_KEY": "organizations/7ffbb587-c89b-49a7-8e49-45186964fa12/apiKeys/afd4070c-a484-4c53-98a4-080efcef64d9",
+    "SYMBOL": "ETH-USDC",
+    "TRADE_VALUE_USDC": "100",
+    "PRICE_THRESHOLD_BUY": "2500",
+    "PRICE_THRESHOLD_SELL": "2700",
+    "STOP_LOSS_PERCENTAGE": "0.02",
+    "MAX_LOSS_PERCENTAGE": "0.03"
+}
