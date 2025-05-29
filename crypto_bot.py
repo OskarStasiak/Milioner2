@@ -29,13 +29,40 @@ with open('cdp_api_key.json', 'r') as f:
 
 # Parametry handlowe
 TRADING_PAIRS = ['ETH-USDC', 'BTC-USDC']  # Tylko te dwie pary są obsługiwane
-TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 50))  # Wartość pojedynczej transakcji
+TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 30))  # Zmniejszona wartość pojedynczej transakcji
 MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 300))  # Maksymalna ekspozycja całkowita
-MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', 100))  # Maksymalny rozmiar pozycji
+MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', 50))  # Zmniejszony maksymalny rozmiar pozycji
 PRICE_THRESHOLD_BUY = float(os.getenv('PRICE_THRESHOLD_BUY', 1500))
 PRICE_THRESHOLD_SELL = float(os.getenv('PRICE_THRESHOLD_SELL', 4000))
 MIN_PROFIT_PERCENT = float(os.getenv('MIN_PROFIT_PERCENT', 0.3))
 MAX_LOSS_PERCENT = float(os.getenv('MAX_LOSS_PERCENT', 0.5))
+
+# Nowe parametry dla stop-loss i take-profit
+STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', 2.0))  # Stop-loss na -2%
+TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', 3.0))  # Take-profit na +3%
+TRAILING_STOP_PERCENT = float(os.getenv('TRAILING_STOP_PERCENT', 1.0))  # Trailing stop 1%
+
+# Parametry podwajania zysków
+PROFIT_DOUBLING_DAYS = 3  # Co ile dni podwajamy zyski
+INITIAL_PROFIT_TARGET = 1.0  # Początkowy cel zysku w procentach
+MAX_PROFIT_TARGET = 10.0  # Maksymalny cel zysku w procentach
+PROFIT_MULTIPLIER = 2.0  # Mnożnik do podwajania zysków
+
+# Parametry zarządzania kapitałem
+CAPITAL_ALLOCATION = {
+    'ETH-USDC': 0.4,  # 40% kapitału na ETH
+    'BTC-USDC': 0.4,  # 40% kapitału na BTC
+    'RESERVE': 0.2    # 20% kapitału jako rezerwa
+}
+
+MIN_TRADE_SIZE_USDC = 20  # Minimalna wielkość zlecenia
+MAX_TRADES_PER_DAY = 5    # Maksymalna liczba transakcji dziennie
+
+# Parametry zarządzania zyskami
+MIN_PROFIT_TARGET = 0.5  # Minimalny cel zysku w procentach
+MAX_PROFIT_TARGET = 5.0  # Maksymalny cel zysku w procentach
+VOLATILITY_MULTIPLIER = 2.0  # Mnożnik zmienności do obliczania celu zysku
+TREND_STRENGTH_MULTIPLIER = 1.5  # Mnożnik siły trendu do obliczania celu zysku
 
 # Inicjalizacja API
 client = RESTClient(api_key=API_KEY, api_secret=API_SECRET)
@@ -53,7 +80,8 @@ for pair in TRADING_PAIRS:
         'price_history': [],
         'last_buy_price': None,
         'last_sell_price': None,
-        'trade_history': []
+        'trade_history': [],
+        'highest_price': None
     }
 
 def on_ws_message(data):
@@ -504,15 +532,22 @@ def check_total_exposure():
                     # Sprawdź czy para istnieje przed próbą pobrania ceny
                     pair = f"{currency}-USDC"
                     if pair not in TRADING_PAIRS:
+                        logging.debug(f"Para {pair} nie jest obsługiwana - pomijam")
                         continue
+                        
                     current_price = get_current_price(pair)
                     if current_price is None:
+                        logging.debug(f"Nie można pobrać ceny dla {pair} - pomijam")
                         continue
+                        
                     position_value = float(data['total']) * current_price
                     total_exposure += position_value
-                except:
+                    logging.debug(f"Ekspozycja dla {pair}: {position_value:.2f} USDC")
+                except Exception as e:
+                    logging.debug(f"Błąd przy obliczaniu ekspozycji dla {currency}: {e}")
                     continue
                     
+        logging.info(f"Całkowita ekspozycja: {total_exposure:.2f} USDC")
         return total_exposure
     except Exception as e:
         logging.error(f"Błąd podczas sprawdzania ekspozycji: {e}")
@@ -530,6 +565,148 @@ def can_open_new_position():
         logging.error(f"Błąd podczas sprawdzania możliwości otwarcia pozycji: {e}")
         return False
 
+def calculate_profit_target(product_id, historical_data):
+    """Oblicza dynamiczny cel zysku na podstawie analizy rynku."""
+    try:
+        if historical_data is None or len(historical_data) < 24:
+            return MIN_PROFIT_TARGET
+            
+        # Oblicz zmienność ceny
+        volatility = calculate_volatility(historical_data)
+        
+        # Oblicz siłę trendu
+        rsi = calculate_rsi(historical_data)
+        macd, signal, hist = calculate_macd(historical_data)
+        ma_short, ma_long = calculate_moving_averages(historical_data)
+        
+        if macd is None or ma_short is None:
+            return MIN_PROFIT_TARGET
+            
+        # Określ siłę trendu
+        trend_strength = 1.0
+        if current_price > ma_short and ma_short > ma_long:
+            trend_strength = TREND_STRENGTH_MULTIPLIER
+        elif current_price < ma_short and ma_short < ma_long:
+            trend_strength = 0.5
+            
+        # Oblicz cel zysku na podstawie zmienności i trendu
+        profit_target = volatility * VOLATILITY_MULTIPLIER * trend_strength
+        
+        # Ogranicz cel zysku do rozsądnych wartości
+        profit_target = max(MIN_PROFIT_TARGET, min(profit_target, MAX_PROFIT_TARGET))
+        
+        logging.info(f"Obliczony cel zysku dla {product_id}: {profit_target:.2f}% (zmienność: {volatility:.2f}%, siła trendu: {trend_strength:.2f})")
+        return profit_target
+        
+    except Exception as e:
+        logging.error(f"Błąd podczas obliczania celu zysku: {e}")
+        return MIN_PROFIT_TARGET
+
+def should_take_profit(product_id, current_price, historical_data):
+    """Sprawdza czy należy zrealizować zysk na podstawie dynamicznej analizy rynku."""
+    try:
+        last_buy_price = market_data[product_id].get('last_buy_price')
+        if not last_buy_price:
+            return False
+            
+        # Oblicz procentową zmianę ceny
+        price_change_percent = ((current_price - last_buy_price) / last_buy_price) * 100
+        
+        # Pobierz dynamiczny cel zysku
+        profit_target = calculate_profit_target(product_id, historical_data)
+        
+        # Sprawdź czy osiągnięto cel zysku
+        if price_change_percent >= profit_target:
+            logging.info(f"Osiągnięto cel zysku {profit_target:.2f}% dla {product_id} (zmiana: {price_change_percent:.2f}%)")
+            return True
+            
+        # Sprawdź czy trend się odwraca
+        rsi = calculate_rsi(historical_data)
+        macd, signal, hist = calculate_macd(historical_data)
+        
+        if price_change_percent > 0 and rsi > 70 and hist < 0:
+            logging.info(f"Trend się odwraca - realizacja zysku {price_change_percent:.2f}% dla {product_id}")
+            return True
+            
+        return False
+        
+    except Exception as e:
+        logging.error(f"Błąd podczas sprawdzania realizacji zysku: {e}")
+        return False
+
+def check_stop_loss_take_profit(product_id, current_price):
+    """Sprawdza warunki stop-loss i take-profit dla danej pozycji."""
+    try:
+        if product_id not in market_data:
+            return False
+            
+        last_buy_price = market_data[product_id].get('last_buy_price')
+        if not last_buy_price:
+            return False
+            
+        # Pobierz dane historyczne
+        historical_data = market_data[product_id].get('price_history')
+        
+        # Sprawdź stop-loss
+        price_change_percent = ((current_price - last_buy_price) / last_buy_price) * 100
+        if price_change_percent <= -STOP_LOSS_PERCENT:
+            logging.info(f"STOP-LOSS dla {product_id} przy cenie {current_price} (zmiana: {price_change_percent:.2f}%)")
+            return True
+            
+        # Sprawdź dynamiczny take-profit
+        if should_take_profit(product_id, current_price, historical_data):
+            return True
+            
+        # Sprawdź trailing stop
+        highest_price = market_data[product_id].get('highest_price', last_buy_price)
+        if current_price > highest_price:
+            market_data[product_id]['highest_price'] = current_price
+        elif current_price < highest_price * (1 - TRAILING_STOP_PERCENT/100):
+            logging.info(f"TRAILING-STOP dla {product_id} przy cenie {current_price} (najwyższa: {highest_price})")
+            return True
+            
+        return False
+    except Exception as e:
+        logging.error(f"Błąd podczas sprawdzania stop-loss/take-profit: {e}")
+        return False
+
+def get_available_capital_for_pair(product_id):
+    """Oblicza dostępny kapitał dla danej pary handlowej."""
+    try:
+        total_capital = get_usdc_balance()
+        allocation = CAPITAL_ALLOCATION.get(product_id, 0)
+        return total_capital * allocation
+    except Exception as e:
+        logging.error(f"Błąd podczas obliczania dostępnego kapitału: {e}")
+        return 0
+
+def can_trade_today(product_id):
+    """Sprawdza czy można wykonać kolejną transakcję dzisiaj."""
+    try:
+        today = datetime.utcnow().date()
+        trades_today = sum(1 for trade in market_data[product_id]['trade_history'] 
+                         if trade['timestamp'].date() == today)
+        return trades_today < MAX_TRADES_PER_DAY
+    except Exception as e:
+        logging.error(f"Błąd podczas sprawdzania limitów dziennych: {e}")
+        return False
+
+def calculate_trade_size(product_id, current_price):
+    """Oblicza optymalną wielkość zlecenia."""
+    try:
+        available_capital = get_available_capital_for_pair(product_id)
+        if available_capital < MIN_TRADE_SIZE_USDC:
+            return 0
+            
+        # Oblicz wielkość zlecenia jako 20% dostępnego kapitału
+        trade_size = min(available_capital * 0.2, MAX_POSITION_SIZE)
+        amount = trade_size / current_price
+        
+        return amount
+    except Exception as e:
+        logging.error(f"Błąd podczas obliczania wielkości zlecenia: {e}")
+        return 0
+
 def place_buy_order(product_id, amount, price):
     """Złóż zlecenie kupna dla danej pary."""
     try:
@@ -538,9 +715,16 @@ def place_buy_order(product_id, amount, price):
             logging.info("Nie można otworzyć nowej pozycji - przekroczono maksymalną ekspozycję")
             return None
             
-        # Ogranicz wielkość pojedynczej transakcji
-        max_amount = min(TRADE_VALUE_USDC, MAX_POSITION_SIZE) / price
-        amount = min(amount, max_amount)
+        # Sprawdź limity dzienne
+        if not can_trade_today(product_id):
+            logging.info(f"Osiągnięto dzienny limit transakcji dla {product_id}")
+            return None
+            
+        # Oblicz optymalną wielkość zlecenia
+        amount = calculate_trade_size(product_id, price)
+        if amount == 0:
+            logging.info(f"Za mało kapitału na zlecenie dla {product_id}")
+            return None
         
         order = client.create_order(
             client_order_id=str(int(time.time() * 1000)),
@@ -552,13 +736,17 @@ def place_buy_order(product_id, amount, price):
                 }
             }
         )
+        
+        # Zapisz informacje o transakcji
         market_data[product_id]['last_buy_price'] = price
+        market_data[product_id]['highest_price'] = price
         market_data[product_id]['trade_history'].append({
             'type': 'buy',
             'price': price,
             'amount': amount,
             'timestamp': datetime.utcnow()
         })
+        
         logging.info(f"Złożono zlecenie kupna dla {product_id}: {order}")
         return order
     except Exception as e:
@@ -672,13 +860,20 @@ def print_detailed_balances():
                 hold = float(data['hold'])
                 staked = float(data['staked'])
                 
-                # Jeśli to nie USDC, pobierz aktualną cenę
+                # Jeśli to nie USDC, sprawdź czy para handlowa istnieje
                 if currency != 'USDC':
-                    try:
-                        current_price = get_current_price(f"{currency}-USDC")
-                        value_usdc = total * current_price
-                        total_value_usdc += value_usdc
-                    except:
+                    pair = f"{currency}-USDC"
+                    if pair in TRADING_PAIRS:
+                        try:
+                            current_price = get_current_price(pair)
+                            if current_price is not None:
+                                value_usdc = total * current_price
+                                total_value_usdc += value_usdc
+                            else:
+                                value_usdc = 0
+                        except:
+                            value_usdc = 0
+                    else:
                         value_usdc = 0
                 else:
                     value_usdc = total
@@ -769,6 +964,8 @@ def main():
         # Subskrybuj do kanałów
         for product_id in TRADING_PAIRS:
             ws_client.subscribe_to_channels(product_id)
+            # Inicjalizuj cele zysku dla każdej pary
+            market_data[product_id]['profit_target'] = INITIAL_PROFIT_TARGET
         
         while True:
             try:
@@ -788,6 +985,14 @@ def main():
                             market_data[product_id]['current_price'] = current_price
                             logging.info(f"Aktualna cena {product_id}: {current_price}")
                             
+                            # Sprawdź stop-loss i take-profit
+                            if check_stop_loss_take_profit(product_id, current_price):
+                                crypto_symbol = product_id.split('-')[0]
+                                crypto_balance = get_crypto_balance(crypto_symbol)
+                                if crypto_balance > 0:
+                                    place_sell_order(product_id, crypto_balance, current_price)
+                                    continue
+                            
                             # Pobierz dane historyczne
                             historical_data = get_historical_data(product_id)
                             if historical_data is not None:
@@ -804,9 +1009,10 @@ def main():
                                     logging.info(f"Saldo {crypto_symbol}: {crypto_balance}")
                                     
                                     # Podejmij decyzję handlową
-                                    if current_price <= PRICE_THRESHOLD_BUY and usdc_balance >= TRADE_VALUE_USDC:
-                                        amount = TRADE_VALUE_USDC / current_price
-                                        place_buy_order(product_id, amount, current_price)
+                                    if current_price <= PRICE_THRESHOLD_BUY and usdc_balance >= MIN_TRADE_SIZE_USDC:
+                                        amount = calculate_trade_size(product_id, current_price)
+                                        if amount > 0:
+                                            place_buy_order(product_id, amount, current_price)
                                     elif current_price >= PRICE_THRESHOLD_SELL and crypto_balance > 0:
                                         place_sell_order(product_id, crypto_balance, current_price)
                     
