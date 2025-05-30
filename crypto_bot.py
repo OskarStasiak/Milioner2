@@ -542,30 +542,11 @@ def get_account_balance():
         raise
 
 def get_product_ticker(product_id):
-    """Pobiera aktualną cenę dla danej pary."""
     try:
-        # Sprawdź czy para jest na liście dostępnych par
-        if product_id not in TRADING_PAIRS:
-            logger.warning(f"Para {product_id} nie jest na liście dostępnych par handlowych")
-            return None
-
-        # Sprawdź czy para istnieje na giełdzie
-        try:
-            product = client.get_product(product_id)
-            if not product:
-                logger.warning(f"Para {product_id} nie istnieje na giełdzie")
-                return None
-        except Exception as e:
-            logger.error(f"Błąd podczas sprawdzania pary {product_id}: {e}")
-            return None
-
-        # Pobierz ticker
-        ticker = client.get_product_ticker(product_id=product_id)
-        if not ticker:
-            logger.warning(f"Nie udało się pobrać aktualnej ceny dla {product_id}")
-            return None
-
-        return ticker
+        product = client.get_product(product_id)
+        if product and hasattr(product, 'price'):
+            return float(product.price)
+        return None
     except Exception as e:
         logger.error(f"Błąd podczas pobierania aktualnej ceny dla {product_id}: {e}")
         return None
@@ -1045,6 +1026,31 @@ def load_trade_history():
     except Exception as e:
         logging.error(f"Błąd podczas wczytywania historii transakcji: {e}")
 
+def get_product_candles(product_id, start, end, granularity):
+    """Pobiera świeczki dla danej pary handlowej."""
+    try:
+        # Konwertuj daty na timestamp w sekundach
+        start_timestamp = int(start.timestamp())
+        end_timestamp = int(end.timestamp())
+        
+        # Użyj prawidłowej metody API
+        response = client.get_candles(
+            product_id=product_id,
+            start=start_timestamp,
+            end=end_timestamp,
+            granularity=granularity
+        )
+        
+        if not response or not hasattr(response, 'candles'):
+            logger.warning(f"Brak danych świeczek dla {product_id}")
+            return None
+            
+        return response.candles
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas pobierania świeczek dla {product_id}: {e}")
+        return None
+
 def main():
     """Główna funkcja bota"""
     try:
@@ -1129,12 +1135,7 @@ def main():
                         start_time = end_time - timedelta(days=3)
                         logger.info(f"Pobieram świeczki dla {pair} od {start_time} do {end_time}")
                         
-                        candles = client.get_product_candles(
-                            product_id=pair,
-                            start=start_time,
-                            end=end_time,
-                            granularity='ONE_HOUR'
-                        )
+                        candles = get_product_candles(pair, start_time, end_time, 'ONE_HOUR')
 
                         if not candles:
                             logger.warning(f"Brak danych świeczek dla {pair}")
@@ -1164,7 +1165,7 @@ def main():
                             logger.warning(f"Nie udało się pobrać aktualnej ceny dla {pair}")
                             continue
 
-                        current_price = float(ticker.price)
+                        current_price = float(ticker)
                         logger.info(f"Aktualna cena {pair}: {current_price}")
 
                         # Sprawdzamy sygnały
