@@ -439,7 +439,7 @@ def predict_price(model, X, scaler):
 
 def analyze_market_trend(historical_data):
     """Analizuj trend rynkowy."""
-    if not historical_data:
+    if historical_data is None or historical_data.empty:
         return "neutral"
     
     try:
@@ -454,10 +454,15 @@ def analyze_market_trend(historical_data):
         rs = gain / loss
         historical_data['RSI'] = 100 - (100 / (1 + rs))
         
+        # Pobierz ostatnie wartości
         current_price = historical_data['price'].iloc[-1]
         ma20 = historical_data['MA20'].iloc[-1]
         ma50 = historical_data['MA50'].iloc[-1]
         rsi = historical_data['RSI'].iloc[-1]
+        
+        # Sprawdź czy wartości nie są NaN
+        if pd.isna(ma20) or pd.isna(ma50) or pd.isna(rsi):
+            return "neutral"
         
         # Analiza trendu na podstawie wielu wskaźników
         if current_price > ma20 and ma20 > ma50 and rsi > 50:
@@ -467,7 +472,7 @@ def analyze_market_trend(historical_data):
         else:
             return "neutral"
     except Exception as e:
-        logging.error(f"Błąd podczas analizy trendu: {e}")
+        logger.error(f"Błąd podczas analizy trendu: {e}")
         return "neutral"
 
 def suggest_thresholds(current_price, trend, predicted_price=None):
@@ -822,6 +827,10 @@ def get_all_balances():
         for account in accounts:
             if hasattr(account, 'available_balance') and account.available_balance:
                 currency = account.currency
+                # Sprawdź czy waluta jest obsługiwana
+                if currency not in ['USDC', 'USD', 'BTC', 'ETH']:
+                    continue
+                    
                 # Obsługa różnych formatów danych
                 if isinstance(account.available_balance, dict):
                     available = float(account.available_balance.get('value', 0))
@@ -844,30 +853,17 @@ def get_all_balances():
                 else:
                     hold = 0
 
-                # Sprawdź czy konto ma informacje o stakowaniu
-                staked = 0
-                if hasattr(account, 'staked_balance'):
-                    if isinstance(account.staked_balance, dict):
-                        staked = float(account.staked_balance.get('value', 0))
-                    else:
-                        staked = float(account.staked_balance.value)
-                
-                # Jeśli nie znaleziono bezpośrednio staked_balance, spróbuj obliczyć z różnicy
-                if staked == 0 and total > (available + hold):
-                    staked = total - available - hold
-                
                 balances[currency] = {
                     'available': available,
                     'total': total,
                     'hold': hold,
-                    'staked': staked,
                     'currency': currency,
                     'type': getattr(account, 'type', 'unknown'),
                     'active': getattr(account, 'active', True)
                 }
         return balances
     except Exception as e:
-        logging.error(f"Błąd podczas pobierania sald: {e}")
+        logger.error(f"Błąd podczas pobierania sald: {e}")
         raise
 
 def print_detailed_balances():
@@ -1051,216 +1047,475 @@ def get_product_candles(product_id, start, end, granularity):
         logger.error(f"Błąd podczas pobierania świeczek dla {product_id}: {e}")
         return None
 
+def calculate_market_sentiment(product_id):
+    """Analizuje sentyment rynku na podstawie różnych wskaźników."""
+    try:
+        historical_data = get_historical_data(product_id)
+        if historical_data is None or len(historical_data) < 50:
+            return 0
+
+        # Oblicz wskaźniki
+        rsi = calculate_rsi(historical_data['price'])
+        macd, signal, hist = calculate_macd(historical_data['price'])
+        ma20, ma50 = calculate_moving_averages(historical_data['price'])
+        volatility = calculate_volatility(historical_data)
+        
+        # Oblicz głębokość rynku
+        market_depth = calculate_market_depth()
+        if market_depth:
+            depth_ratio = market_depth['ratio']
+        else:
+            depth_ratio = 1.0
+
+        # Oblicz sentyment (wartość od -1 do 1)
+        sentiment = 0
+        
+        # RSI contribution
+        if rsi < 30:
+            sentiment += 0.2
+        elif rsi > 70:
+            sentiment -= 0.2
+            
+        # MACD contribution
+        if macd > signal:
+            sentiment += 0.2
+        else:
+            sentiment -= 0.2
+            
+        # Moving Averages contribution
+        if ma20 > ma50:
+            sentiment += 0.2
+        else:
+            sentiment -= 0.2
+            
+        # Volatility contribution
+        if volatility < 1.0:  # Niska zmienność
+            sentiment += 0.1
+        elif volatility > 3.0:  # Wysoka zmienność
+            sentiment -= 0.1
+            
+        # Market depth contribution
+        if depth_ratio > 1.2:  # Więcej kupujących
+            sentiment += 0.2
+        elif depth_ratio < 0.8:  # Więcej sprzedających
+            sentiment -= 0.2
+            
+        return sentiment
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania sentymentu rynku: {e}")
+        return 0
+
+def calculate_position_size(product_id, current_price, sentiment):
+    """Oblicza optymalny rozmiar pozycji na podstawie sentymentu i zarządzania ryzykiem."""
+    try:
+        # Pobierz dostępny kapitał dla pary
+        available_capital = get_available_capital_for_pair(product_id)
+        
+        # Pobierz historię transakcji
+        trade_history = market_data[product_id]['trade_history']
+        
+        # Oblicz dzienny P&L
+        daily_pnl = 0
+        today = datetime.utcnow().date()
+        for trade in trade_history:
+            trade_date = datetime.strptime(trade['timestamp'], '%Y-%m-%d %H:%M:%S.%f').date()
+            if trade_date == today:
+                if trade['type'] == 'sell':
+                    daily_pnl += (trade['price'] - market_data[product_id]['last_buy_price']) * trade['amount']
+                else:
+                    daily_pnl -= trade['price'] * trade['amount']
+        
+        # Dostosuj rozmiar pozycji na podstawie sentymentu
+        base_size = TRADE_VALUE_USDC
+        
+        # Zmniejsz rozmiar jeśli sentyment jest negatywny
+        if sentiment < -0.5:
+            base_size *= 0.5
+        elif sentiment < 0:
+            base_size *= 0.75
+            
+        # Zmniejsz rozmiar jeśli dzienny P&L jest ujemny
+        if daily_pnl < 0:
+            base_size *= 0.5
+            
+        # Sprawdź maksymalny rozmiar pozycji
+        max_size = min(available_capital, MAX_POSITION_SIZE)
+        
+        # Zwróć mniejszą z wartości
+        return min(base_size, max_size)
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania rozmiaru pozycji: {e}")
+        return MIN_TRADE_SIZE_USDC
+
+def implement_trailing_stop(product_id, current_price):
+    """Implementuje trailing stop dla otwartych pozycji."""
+    try:
+        trade_history = market_data[product_id]['trade_history']
+        if not trade_history:
+            return False
+            
+        # Znajdź ostatnią transakcję kupna
+        last_buy = None
+        for trade in reversed(trade_history):
+            if trade['type'] == 'buy':
+                last_buy = trade
+                break
+                
+        if not last_buy:
+            return False
+            
+        # Oblicz zysk
+        profit_percent = (current_price - last_buy['price']) / last_buy['price'] * 100
+        
+        # Jeśli zysk przekracza trailing stop, zaktualizuj stop loss
+        if profit_percent > TRAILING_STOP_PERCENT:
+            new_stop_price = current_price * (1 - TRAILING_STOP_PERCENT/100)
+            
+            # Jeśli cena spadła poniżej nowego stop loss, sprzedaj
+            if current_price < new_stop_price:
+                amount = last_buy['amount']
+                place_sell_order(product_id, amount, current_price)
+                logger.info(f"Wykonano trailing stop dla {product_id} przy cenie {current_price}")
+                return True
+                
+        return False
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas implementacji trailing stop: {e}")
+        return False
+
+def analyze_correlation():
+    """Analizuje korelację między kryptowalutami."""
+    try:
+        correlations = {}
+        for pair in TRADING_PAIRS:
+            historical_data = get_historical_data(pair)
+            if historical_data is not None:
+                correlations[pair] = historical_data['price']
+                
+        # Oblicz korelację między parami
+        correlation_matrix = pd.DataFrame(correlations).corr()
+        
+        # Znajdź pary z wysoką korelacją
+        high_correlation_pairs = []
+        for i in range(len(correlation_matrix.columns)):
+            for j in range(i+1, len(correlation_matrix.columns)):
+                if abs(correlation_matrix.iloc[i,j]) > 0.7:  # Korelacja powyżej 0.7
+                    high_correlation_pairs.append({
+                        'pair1': correlation_matrix.columns[i],
+                        'pair2': correlation_matrix.columns[j],
+                        'correlation': correlation_matrix.iloc[i,j]
+                    })
+                    
+        return high_correlation_pairs
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas analizy korelacji: {e}")
+        return []
+
+def analyze_market_conditions():
+    """Analizuje ogólne warunki rynkowe."""
+    try:
+        market_conditions = {
+            'volatility': {},
+            'trend': {},
+            'sentiment': {},
+            'correlation': [],
+            'risk_level': 'NORMAL'
+        }
+        
+        # Analizuj każdą parę
+        for pair in TRADING_PAIRS:
+            historical_data = get_historical_data(pair)
+            if historical_data is not None and not historical_data.empty:
+                # Oblicz zmienność
+                volatility = calculate_volatility(historical_data)
+                market_conditions['volatility'][pair] = volatility
+                
+                # Analizuj trend
+                trend = analyze_market_trend(historical_data)
+                market_conditions['trend'][pair] = trend
+                
+                # Oblicz sentyment
+                sentiment = calculate_market_sentiment(pair)
+                market_conditions['sentiment'][pair] = sentiment
+                
+        # Analizuj korelacje
+        market_conditions['correlation'] = analyze_correlation()
+        
+        # Określ poziom ryzyka
+        high_volatility_count = sum(1 for v in market_conditions['volatility'].values() if v > 3.0)
+        negative_sentiment_count = sum(1 for s in market_conditions['sentiment'].values() if s < -0.5)
+        
+        if high_volatility_count >= 2 or negative_sentiment_count >= 2:
+            market_conditions['risk_level'] = 'HIGH'
+        elif high_volatility_count >= 1 or negative_sentiment_count >= 1:
+            market_conditions['risk_level'] = 'MEDIUM'
+            
+        return market_conditions
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas analizy warunków rynkowych: {e}")
+        return None
+
+def clear_trade_history():
+    """Czyści historię transakcji dla wszystkich par."""
+    try:
+        for pair in TRADING_PAIRS:
+            if pair in market_data:
+                market_data[pair]['trade_history'] = []
+                market_data[pair]['last_buy_price'] = None
+                market_data[pair]['last_sell_price'] = None
+                market_data[pair]['highest_price'] = None
+        save_trade_history()
+        logger.info("Wyczyszczono historię transakcji")
+    except Exception as e:
+        logger.error(f"Błąd podczas czyszczenia historii transakcji: {e}")
+
+def implement_risk_management():
+    """Implementuje zarządzanie ryzykiem dla całego portfela."""
+    try:
+        # Pobierz wszystkie salda
+        balances = get_all_balances()
+        
+        # Oblicz całkowitą wartość portfela
+        total_value = 0
+        for currency, data in balances.items():
+            if currency in ['USDC', 'USD']:
+                total_value += float(data['available'])
+            elif currency in ['BTC', 'ETH']:
+                # Pobierz aktualną cenę
+                price = get_product_ticker(f"{currency}-USDC")
+                if price:
+                    total_value += float(data['available']) * float(price)
+                    
+        # Sprawdź dzienny P&L
+        daily_pnl = 0
+        today = datetime.utcnow().date()
+        
+        # Najpierw sprawdź i zresetuj historię transakcji dla wszystkich par
+        for pair in TRADING_PAIRS:
+            if pair not in market_data:
+                continue
+                
+            trade_history = market_data[pair]['trade_history']
+            if trade_history:
+                # Znajdź najnowszą transakcję
+                last_trade = max(trade_history, key=lambda x: x['timestamp'])
+                last_trade_date = last_trade['timestamp'].date()
+                
+                # Jeśli ostatnia transakcja była wcześniej niż dzisiaj, zresetuj historię
+                if last_trade_date < today:
+                    market_data[pair]['trade_history'] = []
+                    market_data[pair]['last_buy_price'] = None
+                    market_data[pair]['last_sell_price'] = None
+                    market_data[pair]['highest_price'] = None
+                    logger.info(f"Reset historii transakcji dla {pair} - nowy dzień")
+                    save_trade_history()  # Zapisz zmiany
+        
+        # Teraz oblicz P&L tylko dla dzisiejszych transakcji
+        for pair in TRADING_PAIRS:
+            if pair not in market_data:
+                continue
+                
+            trade_history = market_data[pair]['trade_history']
+            
+            for trade in trade_history:
+                if not isinstance(trade['timestamp'], datetime):
+                    continue
+                    
+                trade_date = trade['timestamp'].date()
+                if trade_date == today:
+                    if trade['type'] == 'sell' and 'last_buy_price' in market_data[pair]:
+                        profit = (float(trade['price']) - float(market_data[pair]['last_buy_price'])) * float(trade['amount'])
+                        daily_pnl += profit
+                        logger.info(f"Transakcja sprzedaży dla {pair}: {profit:.2f} USDC")
+                    elif trade['type'] == 'buy':
+                        cost = float(trade['price']) * float(trade['amount'])
+                        daily_pnl -= cost
+                        logger.info(f"Transakcja kupna dla {pair}: -{cost:.2f} USDC")
+        
+        # Loguj aktualny P&L
+        logger.info(f"Aktualny dzienny P&L: {daily_pnl:.2f} USDC")
+        logger.info(f"Limit P&L: {total_value * 0.05:.2f} USDC")
+        
+        # Jeśli dzienny P&L jest ujemny i przekracza 5% wartości portfela, zatrzymaj handel
+        if daily_pnl < 0 and abs(daily_pnl) > total_value * 0.05:
+            logger.warning(f"Dzienny P&L przekroczył limit: {daily_pnl:.2f} USDC (limit: {total_value * 0.05:.2f} USDC)")
+            # Wyczyść historię transakcji aby zacząć od nowa
+            clear_trade_history()
+            return False
+            
+        # Sprawdź maksymalną ekspozycję
+        total_exposure = check_total_exposure()
+        if total_exposure > MAX_TOTAL_EXPOSURE:
+            logger.warning(f"Maksymalna ekspozycja przekroczona: {total_exposure:.2f} USDC (limit: {MAX_TOTAL_EXPOSURE:.2f} USDC)")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas zarządzania ryzykiem: {e}")
+        return False
+
 def main():
     """Główna funkcja bota"""
     try:
-        # Inicjalizacja klienta
-        global client
-        client = get_authenticated_client()
-        if not client:
-            logger.error("Nie udało się zainicjalizować klienta")
-            return
-
         logger.info("=== ROZPOCZYNAM DZIAŁANIE BOTA ===")
-        logger.info("Sprawdzam dostępność par handlowych...")
         
         # Sprawdź dostępność par handlowych
+        logger.info("Sprawdzam dostępność par handlowych...")
         for pair in TRADING_PAIRS:
             try:
-                product = client.get_product(pair)
-                if product:
-                    logger.info(f"Para {pair} jest dostępna")
-                else:
-                    logger.error(f"Para {pair} nie jest dostępna")
-                    return
+                client.get_product(pair)
+                logger.info(f"Para {pair} jest dostępna")
             except Exception as e:
-                logger.error(f"Błąd podczas sprawdzania pary {pair}: {e}")
+                logger.error(f"Para {pair} jest niedostępna: {e}")
                 return
-
-        # Wczytaj historię transakcji
+                
+        # Załaduj historię transakcji
         load_trade_history()
-        logger.info("Historia transakcji wczytana")
-
-        # Inicjalizacja WebSocket
-        ws.connect()
-        time.sleep(2)  # Czekamy na połączenie
-        logger.info("WebSocket połączony")
-
-        # Subskrybujemy się do kanałów
-        for pair in TRADING_PAIRS:
-            try:
-                ws.subscribe_to_ticker(pair)
-                time.sleep(0.5)
-                ws.subscribe_to_level2(pair)
-                time.sleep(0.5)
-                ws.subscribe_to_market_trades(pair)
-                time.sleep(0.5)
-                logger.info(f"Subskrybowano do kanałów dla {pair}")
-            except Exception as e:
-                logger.error(f"Błąd podczas subskrybowania do kanałów dla {pair}: {str(e)}")
-                continue
-
-        logger.info("=== ROZPOCZYNAM GŁÓWNĄ PĘTLĘ HANDLOWĄ ===")
         
+        # Główna pętla handlowa
         while True:
             try:
                 logger.info("\n=== NOWA ITERACJA PĘTLI HANDLOWEJ ===")
                 
-                # Sprawdzamy stan połączenia
-                if not ws.is_connected():
-                    logger.warning("Utracono połączenie WebSocket, próba ponownego połączenia...")
-                    ws.connect()
-                    time.sleep(2)
-                    continue
-
-                # Sprawdzamy salda
+                # Sprawdź salda
+                logger.info("\n=== AKTUALNE SALDA ===")
                 usdc_balance = get_usdc_balance()
                 usd_balance = get_usd_balance()
-                btc_balance = get_crypto_balance('BTC')
-                eth_balance = get_crypto_balance('ETH')
-
-                logger.info(f"\n=== AKTUALNE SALDA ===")
                 logger.info(f"USDC: {usdc_balance}")
                 logger.info(f"USD: {usd_balance}")
-                logger.info(f"BTC: {btc_balance}")
-                logger.info(f"ETH: {eth_balance}")
-
-                # Sprawdzamy każdą parę
-                for pair in TRADING_PAIRS:
-                    try:
+                
+                # Analizuj warunki rynkowe
+                market_conditions = analyze_market_conditions()
+                if market_conditions:
+                    logger.info("\n=== WARUNKI RYNKOWE ===")
+                    logger.info(f"Poziom ryzyka: {market_conditions['risk_level']}")
+                    
+                    # Sprawdź zarządzanie ryzykiem
+                    if not implement_risk_management():
+                        logger.warning("Zatrzymuję handel ze względu na zarządzanie ryzykiem")
+                        time.sleep(300)  # Czekaj 5 minut przed następną iteracją
+                        continue
+                        
+                    # Analizuj każdą parę
+                    for pair in TRADING_PAIRS:
                         logger.info(f"\n=== ANALIZA PARY {pair} ===")
                         
-                        # Pobieramy świeczki
-                        end_time = datetime.now()
-                        start_time = end_time - timedelta(days=3)
-                        logger.info(f"Pobieram świeczki dla {pair} od {start_time} do {end_time}")
-                        
-                        candles = get_product_candles(pair, start_time, end_time, 'ONE_HOUR')
-
-                        if not candles:
-                            logger.warning(f"Brak danych świeczek dla {pair}")
+                        # Pobierz dane historyczne
+                        historical_data = get_historical_data(pair)
+                        if historical_data is None:
                             continue
-
-                        logger.info(f"Otrzymano {len(candles)} świeczek dla {pair}")
-
-                        # Konwertujemy dane
-                        df = pd.DataFrame([{
-                            'timestamp': candle.start,
-                            'price': float(candle.close),
-                            'size': float(candle.volume)
-                        } for candle in candles])
-
-                        # Obliczamy wskaźniki
-                        df['rsi'] = calculate_rsi(df['price'])
-                        macd, signal, hist = calculate_macd(df['price'])
-                        df['macd'] = macd
-                        df['signal'] = signal
-                        df['hist'] = hist
-                        df['ma20'] = calculate_moving_averages(df['price'])[0]
-                        df['ma50'] = calculate_moving_averages(df['price'])[1]
-
-                        # Pobieramy aktualną cenę
-                        ticker = get_product_ticker(pair)
-                        if not ticker:
-                            logger.warning(f"Nie udało się pobrać aktualnej ceny dla {pair}")
+                            
+                        # Pobierz aktualną cenę
+                        current_price = get_product_ticker(pair)
+                        if not current_price:
                             continue
-
-                        current_price = float(ticker)
+                            
                         logger.info(f"Aktualna cena {pair}: {current_price}")
-
-                        # Sprawdzamy sygnały
-                        last_row = df.iloc[-1]
+                        
+                        # Oblicz wskaźniki techniczne
                         logger.info(f"\n=== WSKAŹNIKI TECHNICZNE DLA {pair} ===")
-                        logger.info(f"RSI: {last_row['rsi']:.2f}")
-                        logger.info(f"MACD: {last_row['macd']:.2f}")
-                        logger.info(f"Signal: {last_row['signal']:.2f}")
-                        logger.info(f"Histogram: {last_row['hist']:.2f}")
-                        logger.info(f"MA20: {last_row['ma20']:.2f}")
-                        logger.info(f"MA50: {last_row['ma50']:.2f}")
-
-                        # Obliczamy zmienność ceny
-                        price_change = (current_price - df['price'].iloc[-2]) / df['price'].iloc[-2] * 100
-                        logger.info(f"Zmienność ceny: {price_change:.2f}%")
-
-                        # Sprawdzamy warunki handlowe
-                        if pair in ['BTC-USDC', 'BTC-USD']:
-                            if btc_balance > 0:
-                                logger.info(f"\n=== SPRAWDZANIE WARUNKÓW SPRZEDAŻY BTC ===")
-                                logger.info(f"RSI > 60: {last_row['rsi'] > 60}")
-                                logger.info(f"MACD < Signal: {last_row['macd'] < last_row['signal']}")
-                                logger.info(f"Histogram < 0: {last_row['hist'] < 0}")
-                                logger.info(f"Cena < MA20: {current_price < last_row['ma20']}")
+                        rsi = calculate_rsi(historical_data['price'])
+                        macd, signal, hist = calculate_macd(historical_data['price'])
+                        ma20, ma50 = calculate_moving_averages(historical_data['price'])
+                        volatility = calculate_volatility(historical_data)
+                        
+                        logger.info(f"RSI: {rsi:.2f}")
+                        logger.info(f"MACD: {macd:.2f}")
+                        logger.info(f"Signal: {signal:.2f}")
+                        logger.info(f"Histogram: {hist:.2f}")
+                        logger.info(f"MA20: {ma20:.2f}")
+                        logger.info(f"MA50: {ma50:.2f}")
+                        logger.info(f"Zmienność ceny: {volatility:.2f}%")
+                        
+                        # Oblicz sentyment rynku
+                        sentiment = calculate_market_sentiment(pair)
+                        
+                        # Sprawdź trailing stop
+                        if implement_trailing_stop(pair, current_price):
+                            continue
+                            
+                        # Sprawdź warunki kupna
+                        if pair.endswith('USDC'):
+                            logger.info(f"\n=== SPRAWDZANIE WARUNKÓW KUPNA {pair.split('-')[0]} ZA USDC ===")
+                            
+                            # Sprawdź podstawowe warunki
+                            rsi_condition = rsi < 50
+                            macd_condition = macd > signal
+                            hist_condition = hist > 0
+                            ma_condition = current_price > ma20
+                            
+                            logger.info(f"RSI < 50: {rsi_condition}")
+                            logger.info(f"MACD > Signal: {macd_condition}")
+                            logger.info(f"Histogram > 0: {hist_condition}")
+                            logger.info(f"Cena > MA20: {ma_condition}")
+                            
+                            # Sprawdź dodatkowe warunki
+                            sentiment_condition = sentiment > 0
+                            volatility_condition = volatility < 3.0
+                            risk_condition = market_conditions['risk_level'] != 'HIGH'
+                            
+                            # Jeśli wszystkie warunki są spełnione
+                            if (rsi_condition and macd_condition and hist_condition and ma_condition and 
+                                sentiment_condition and volatility_condition and risk_condition):
                                 
-                                if (last_row['rsi'] > 60 or 
-                                    (last_row['macd'] < last_row['signal'] and last_row['hist'] < 0) or
-                                    current_price < last_row['ma20']):
-                                    logger.info("!!! SYGNAŁ SPRZEDAŻY - PRÓBA REALIZACJI ZYSKU !!!")
-                                    try:
-                                        order = place_sell_order(pair, btc_balance, current_price)
+                                logger.info("!!! SYGNAŁ KUPNA - PRÓBA WEJŚCIA W POZYCJĘ !!!")
+                                
+                                # Oblicz rozmiar pozycji
+                                position_size = calculate_position_size(pair, current_price, sentiment)
+                                
+                                # Złóż zlecenie kupna
+                                order = place_buy_order(pair, position_size, current_price)
+                                if order and order.get('success'):
+                                    logger.info(f"Złożono zlecenie kupna: {order}")
+                                    
+                        # Sprawdź warunki sprzedaży
+                        trade_history = market_data[pair]['trade_history']
+                        if trade_history:
+                            last_buy = None
+                            for trade in reversed(trade_history):
+                                if trade['type'] == 'buy':
+                                    last_buy = trade
+                                    break
+                                    
+                            if last_buy:
+                                # Oblicz zysk
+                                profit_percent = (current_price - last_buy['price']) / last_buy['price'] * 100
+                                
+                                # Sprawdź warunki sprzedaży
+                                if (profit_percent >= TAKE_PROFIT_PERCENT or 
+                                    profit_percent <= -STOP_LOSS_PERCENT or
+                                    sentiment < -0.5):
+                                    
+                                    logger.info(f"!!! SYGNAŁ SPRZEDAŻY - PRÓBA WYJŚCIA Z POZYCJI !!!")
+                                    logger.info(f"Zysk: {profit_percent:.2f}%")
+                                    
+                                    # Sprzedaj całą pozycję
+                                    amount = last_buy['amount']
+                                    order = place_sell_order(pair, amount, current_price)
+                                    if order and order.get('success'):
                                         logger.info(f"Złożono zlecenie sprzedaży: {order}")
-                                    except Exception as e:
-                                        logger.error(f"Błąd podczas składania zlecenia sprzedaży: {e}")
-                        else:  # ETH-USDC lub ETH-USD
-                            if pair == 'ETH-USDC' and usdc_balance >= MIN_TRADE_SIZE_USDC:
-                                logger.info(f"\n=== SPRAWDZANIE WARUNKÓW KUPNA ETH ZA USDC ===")
-                                logger.info(f"RSI < 50: {last_row['rsi'] < 50}")
-                                logger.info(f"MACD > Signal: {last_row['macd'] > last_row['signal']}")
-                                logger.info(f"Histogram > 0: {last_row['hist'] > 0}")
-                                logger.info(f"Cena > MA20: {current_price > last_row['ma20']}")
-                                
-                                if (last_row['rsi'] < 50 or 
-                                    last_row['macd'] > last_row['signal'] or 
-                                    last_row['hist'] > 0 or 
-                                    current_price > last_row['ma20']):
-                                    logger.info("!!! SYGNAŁ KUPNA - PRÓBA WEJŚCIA W POZYCJĘ !!!")
-                                    try:
-                                        order = place_buy_order(pair, usdc_balance, current_price)
-                                        logger.info(f"Złożono zlecenie kupna: {order}")
-                                    except Exception as e:
-                                        logger.error(f"Błąd podczas składania zlecenia kupna: {e}")
-                            elif pair == 'ETH-USD' and usd_balance >= MIN_TRADE_SIZE_USDC:
-                                logger.info(f"\n=== SPRAWDZANIE WARUNKÓW KUPNA ETH ZA USD ===")
-                                logger.info(f"RSI < 50: {last_row['rsi'] < 50}")
-                                logger.info(f"MACD > Signal: {last_row['macd'] > last_row['signal']}")
-                                logger.info(f"Histogram > 0: {last_row['hist'] > 0}")
-                                logger.info(f"Cena > MA20: {current_price > last_row['ma20']}")
-                                
-                                if (last_row['rsi'] < 50 or 
-                                    last_row['macd'] > last_row['signal'] or 
-                                    last_row['hist'] > 0 or 
-                                    current_price > last_row['ma20']):
-                                    logger.info("!!! SYGNAŁ KUPNA - PRÓBA WEJŚCIA W POZYCJĘ !!!")
-                                    try:
-                                        order = place_buy_order(pair, usd_balance, current_price)
-                                        logger.info(f"Złożono zlecenie kupna: {order}")
-                                    except Exception as e:
-                                        logger.error(f"Błąd podczas składania zlecenia kupna: {e}")
-
-                    except Exception as e:
-                        logger.error(f"Błąd podczas przetwarzania pary {pair}: {str(e)}")
-                        continue
-
+                                        
+                # Zapisz historię transakcji
+                save_trade_history()
+                
+                # Czekaj przed następną iteracją
                 logger.info("\n=== CZEKAM 60 SEKUND PRZED NASTĘPNĄ ITERACJĄ ===")
                 time.sleep(60)
-
+                
             except Exception as e:
-                logger.error(f"Błąd w głównej pętli: {str(e)}")
+                logger.error(f"Błąd w głównej pętli: {e}")
                 time.sleep(60)
-
-    except KeyboardInterrupt:
-        logger.info("Zatrzymywanie bota...")
-        ws.disconnect()
-        save_trade_history()
+                
     except Exception as e:
-        logger.error(f"Krytyczny błąd: {str(e)}")
-        ws.disconnect()
-        save_trade_history()
-
+        logger.error(f"Krytyczny błąd: {e}")
+        
 if __name__ == "__main__":
-    print_detailed_balances()
-    print("\nSprawdzanie historii transakcji dla wszystkich par...")
-    for pair in TRADING_PAIRS:
-        get_transaction_history(pair)
     main()
 
 
