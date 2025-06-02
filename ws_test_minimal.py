@@ -2,12 +2,53 @@ import websocket
 import json
 import time
 import logging
+import os
+from dotenv import load_dotenv
+from coinbase.rest import RESTClient
+from pathlib import Path
 
 # Konfiguracja logowania
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+# Załaduj zmienne środowiskowe
+load_dotenv(str(Path(__file__).parent / 'production.env'))
+
+# Konfiguracja API
+API_KEY = os.getenv('CDP_API_KEY_ID')
+API_SECRET = os.getenv('CDP_API_KEY_SECRET')
+
+# Inicjalizacja klienta REST
+client = RESTClient(api_key=API_KEY, api_secret=API_SECRET)
+
+def check_active_orders():
+    """Sprawdza aktywne zlecenia na koncie."""
+    try:
+        print("\n=== SPRAWDZANIE AKTYWNYCH ZLECEŃ ===")
+        orders = client.get_orders()
+        
+        if not orders.orders:
+            print("Brak aktywnych zleceń")
+            return
+            
+        print("\n{:<15} {:<10} {:<10} {:<15} {:<15}".format(
+            "Para", "Typ", "Strona", "Cena", "Ilość"
+        ))
+        print("-" * 70)
+        
+        for order in orders.orders:
+            print("{:<15} {:<10} {:<10} {:<15.8f} {:<15.8f}".format(
+                order.product_id,
+                order.order_type,
+                order.side,
+                float(order.price) if order.price else 0,
+                float(order.size) if order.size else 0
+            ))
+            
+    except Exception as e:
+        print(f"Błąd podczas sprawdzania zleceń: {e}")
 
 # URL WebSocket Coinbase Advanced Trade
 WS_URL = "wss://advanced-trade-ws.coinbase.com"
@@ -30,10 +71,13 @@ def on_close(ws, close_status_code, close_msg):
 
 # Funkcja obsługująca otwarcie połączenia
 def on_open(ws):
-    logging.info("Połączenie otwarte. Subskrybuję ticker na BTC-USD...")
+    logging.info("Połączenie otwarte. Sprawdzam aktywne zlecenia...")
+    check_active_orders()
+    
+    logging.info("Subskrybuję ticker na pary handlowe...")
     subscribe_message = {
         "type": "subscribe",
-        "product_ids": ["BTC-USD"],
+        "product_ids": ["BTC-USD", "ETH-USD", "SOL-USD", "DOGE-USD", "XRP-USD"],
         "channel": "ticker"
     }
     logging.info(f"Wysyłam subskrypcję: {json.dumps(subscribe_message, indent=2)}")

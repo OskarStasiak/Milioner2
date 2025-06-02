@@ -13,34 +13,29 @@ from websocket_client import CoinbaseWebSocket
 import threading
 import websocket
 
-# Ładowanie zmiennych środowiskowych
-load_dotenv('production.env')
-
 # Konfiguracja loggera
-logging.basicConfig(
-    filename='crypto_bot.log',
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
 
-# Zmienne globalne
-TRADING_PAIRS = ['ETH-USDC', 'BTC-USDC', 'SOL-USDC', 'DOGE-USDC', 'XRP-USDC', 'MATIC-USDC', 'LINK-USDC']
-market_data = {}
-ws = None
+# Dodaj handler do pliku
+file_handler = logging.FileHandler('crypto_bot.log')
+file_handler.setLevel(logging.INFO)
 
-# Pobierz zmienne z pliku .env
-API_KEY = os.getenv('API_KEY')
-API_SECRET = os.getenv('API_SECRET')
-MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 1000))
-MAX_LOSS_PERCENT = float(os.getenv('MAX_LOSS_PERCENT', 2))
-STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', 1))
-TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', 2))
-TRAILING_STOP_PERCENT = float(os.getenv('TRAILING_STOP_PERCENT', 0.5))
-MIN_TIME_BETWEEN_TRADES = int(os.getenv('MIN_TIME_BETWEEN_TRADES', 300))
-MIN_HOLDING_TIME = int(os.getenv('MIN_HOLDING_TIME', 600))
-MAX_VOLATILITY = float(os.getenv('MAX_VOLATILITY', 5.0))
-TRADE_INTERVAL = int(os.getenv('TRADE_INTERVAL', 30))
+# Dodaj handler do konsoli
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+
+# Format logów
+formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+file_handler.setFormatter(formatter)
+console_handler.setFormatter(formatter)
+
+# Dodaj handlery do loggera
+logger.addHandler(file_handler)
+logger.addHandler(console_handler)
+
+# Załaduj zmienne środowiskowe
+load_dotenv('production.env')
 
 # Konfiguracja API
 with open('cdp_api_key.json', 'r') as f:
@@ -49,11 +44,19 @@ with open('cdp_api_key.json', 'r') as f:
     API_SECRET = api_keys['api_key_secret']
 
 # Parametry handlowe
+TRADING_PAIRS = ['ETH-USDC', 'BTC-USDC', 'SOL-USDC', 'DOGE-USDC', 'XRP-USDC', 'MATIC-USDC', 'LINK-USDC']
 TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 50))  # Zmniejszona wartość pojedynczej transakcji
+MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 200))  # Zwiększone maksymalne narażenie
 MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', 0.05))  # Zwiększony maksymalny rozmiar pozycji
 PRICE_THRESHOLD_BUY = float(os.getenv('PRICE_THRESHOLD_BUY', 2500))  # Obniżony próg kupna
 PRICE_THRESHOLD_SELL = float(os.getenv('PRICE_THRESHOLD_SELL', 2800))  # Podwyższony próg sprzedaży
 MIN_PROFIT_PERCENT = float(os.getenv('MIN_PROFIT_PERCENT', 0.3))  # Zmniejszony minimalny zysk
+MAX_LOSS_PERCENT = float(os.getenv('MAX_LOSS_PERCENT', 1.0))  # Zmniejszona maksymalna strata
+
+# Nowe parametry dla stop-loss i take-profit
+STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', 0.8))  # Zmniejszony stop-loss
+TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', 1.0))  # Zmniejszony take-profit
+TRAILING_STOP_PERCENT = float(os.getenv('TRAILING_STOP_PERCENT', 0.3))  # Zmniejszony trailing stop
 
 # Parametry podwajania zysków
 PROFIT_DOUBLING_DAYS = 2  # Co 2 dni podwajamy zyski
@@ -176,9 +179,8 @@ for pair in TRADING_PAIRS:
         'price_history': [],
         'last_buy_price': None,
         'last_sell_price': None,
-        'trade_history': [],
-        'highest_price': None,
-        'historical_data': None  # Dodajemy pole historical_data
+        'trade_history': [],  # Inicjalizacja pustej historii transakcji
+        'highest_price': None
     }
     logging.info(f"Inicjalizacja danych dla {pair} - historia transakcji wyczyszczona")
 
@@ -253,121 +255,96 @@ def calculate_market_depth(product_id):
         logging.error(f"Błąd podczas obliczania głębokości rynku dla {product_id}: {e}")
         return None
 
-def calculate_volatility(prices):
+def calculate_volatility(historical_data, window=20):
     """Oblicza zmienność ceny."""
     try:
-        if len(prices) < 2:
-            return 0.0
+        if isinstance(historical_data, pd.DataFrame):
+            prices = historical_data['price'].values
+        else:
+            prices = historical_data
             
         # Oblicz procentowe zmiany
         returns = np.diff(prices) / prices[:-1]
         
         # Oblicz odchylenie standardowe
-        volatility = np.std(returns) * 100  # Konwersja na procenty
+        volatility = np.std(returns[-window:]) * 100  # Konwersja na procenty
         
         return float(volatility)
-        
     except Exception as e:
-        logging.error(f"Błąd podczas obliczania zmienności: {e}")
-        return 0.0
+        logger.error(f"Błąd podczas obliczania zmienności: {e}")
+        return 0.0  # Domyślna wartość w przypadku błędu
 
-def calculate_rsi(prices):
+def calculate_rsi(prices, period=14):
     """Oblicza wskaźnik RSI."""
     try:
-        if len(prices) < 14:
-            return None
-        
-        # Oblicz zmiany cen
-        deltas = np.diff(prices)
-        seed = deltas[:14]
-        up = seed[seed >= 0].sum()/14
-        down = -seed[seed < 0].sum()/14
-        rs = up/down if down != 0 else 0
-        rsi = np.zeros_like(prices)
-        rsi[:14] = 100. - 100./(1. + rs)
-        
-        # Oblicz pozostałe wartości RSI
-        for i in range(14, len(prices)):
-            delta = deltas[i - 1]
-            if delta > 0:
-                upval = delta
-                downval = 0.
-            else:
-                upval = 0.
-                downval = -delta
-                
-            up = (up*13 + upval)/14
-            down = (down*13 + downval)/14
-            rs = up/down if down != 0 else 0
-            rsi[i] = 100. - 100./(1. + rs)
+        if isinstance(prices, pd.Series):
+            prices = prices.values
             
-        return float(rsi[-1])  # Zwróć ostatnią wartość RSI jako float
+        delta = np.diff(prices)
+        gain = np.where(delta > 0, delta, 0)
+        loss = np.where(delta < 0, -delta, 0)
         
+        avg_gain = np.mean(gain[:period])
+        avg_loss = np.mean(loss[:period])
+        
+        for i in range(period, len(delta)):
+            avg_gain = (avg_gain * (period - 1) + gain[i]) / period
+            avg_loss = (avg_loss * (period - 1) + loss[i]) / period
+            
+        rs = avg_gain / avg_loss if avg_loss != 0 else 0
+        rsi = 100 - (100 / (1 + rs))
+        
+        return float(rsi)  # Zwracamy pojedynczą wartość float
     except Exception as e:
-        logging.error(f"Błąd podczas obliczania RSI: {e}")
-        return None
+        logger.error(f"Błąd podczas obliczania RSI: {e}")
+        return 50.0  # Domyślna wartość w przypadku błędu
 
-def calculate_macd(prices):
+def calculate_macd(prices, fast=12, slow=26, signal=9):
     """Oblicza wskaźnik MACD."""
     try:
-        if len(prices) < 26:
-            return None, None, None
-        
-        # Oblicz EMA
-        ema12 = pd.Series(prices).ewm(span=12, adjust=False).mean()
-        ema26 = pd.Series(prices).ewm(span=26, adjust=False).mean()
-        
-        # Oblicz MACD i linię sygnału
-        macd = ema12 - ema26
-        signal = macd.ewm(span=9, adjust=False).mean()
-        hist = macd - signal
-        
-        # Pobierz ostatnie wartości i konwertuj na float
-        macd_last = float(macd.iloc[-1])
-        signal_last = float(signal.iloc[-1])
-        hist_last = float(hist.iloc[-1])
-        
-        # Sprawdź czy wartości nie są NaN
-        if pd.isna(macd_last) or pd.isna(signal_last) or pd.isna(hist_last):
-            return None, None, None
+        if isinstance(prices, pd.Series):
+            prices = prices.values
             
-        return macd_last, signal_last, hist_last
+        # Oblicz EMA
+        ema_fast = np.mean(prices[:fast])
+        ema_slow = np.mean(prices[:slow])
         
+        # Oblicz MACD
+        for i in range(fast, len(prices)):
+            ema_fast = (prices[i] * (2 / (fast + 1))) + (ema_fast * (1 - (2 / (fast + 1))))
+            
+        for i in range(slow, len(prices)):
+            ema_slow = (prices[i] * (2 / (slow + 1))) + (ema_slow * (1 - (2 / (slow + 1))))
+            
+        macd = ema_fast - ema_slow
+        
+        # Oblicz linię sygnału
+        signal_line = np.mean([macd] * signal)
+        
+        # Oblicz histogram
+        histogram = macd - signal_line
+        
+        return float(macd), float(signal_line), float(histogram)
     except Exception as e:
-        logging.error(f"Błąd podczas obliczania MACD: {e}")
-        return None, None, None
+        logger.error(f"Błąd podczas obliczania MACD: {e}")
+        return 0.0, 0.0, 0.0  # Domyślne wartości w przypadku błędu
 
-def calculate_moving_averages(prices):
+def calculate_moving_averages(prices, short_period=20, long_period=50):
     """Oblicza średnie kroczące."""
     try:
-        if len(prices) < 50:
-            return None, None
-        
-        # Konwertuj na Series jeśli to nie jest już Series
-        if not isinstance(prices, pd.Series):
-            prices = pd.Series(prices)
+        if isinstance(prices, pd.Series):
+            prices = prices.values
             
-        # Oblicz średnie kroczące
-        ma20 = prices.rolling(window=20).mean()
-        ma50 = prices.rolling(window=50).mean()
+        # Oblicz krótkoterminową średnią kroczącą
+        ma_short = np.mean(prices[-short_period:])
         
-        # Sprawdź czy mamy wystarczająco danych
-        if ma20.isna().all() or ma50.isna().all():
-            return None, None
-            
-        # Pobierz ostatnie wartości i konwertuj na float
-        ma20_last = float(ma20.iloc[-1])
-        ma50_last = float(ma50.iloc[-1])
+        # Oblicz długoterminową średnią kroczącą
+        ma_long = np.mean(prices[-long_period:])
         
-        # Sprawdź czy wartości nie są NaN
-        if pd.isna(ma20_last) or pd.isna(ma50_last):
-            return None, None
-            
-        return ma20_last, ma50_last
-        
+        return float(ma_short), float(ma_long)
     except Exception as e:
-        logging.error(f"Błąd podczas obliczania średnich kroczących: {e}")
-        return None, None
+        logger.error(f"Błąd podczas obliczania średnich kroczących: {e}")
+        return 0.0, 0.0  # Domyślne wartości w przypadku błędu
 
 def get_available_balance(currency):
     """Pobiera dostępne saldo dla danej waluty, ignorując środki w stakingu."""
@@ -437,39 +414,51 @@ def get_crypto_balance(crypto_symbol):
         return 0
 
 def should_trade(current_price, historical_data):
-    """Sprawdza czy należy wykonać transakcję na podstawie wskaźników technicznych."""
+    """Decyduje, czy należy wykonać transakcję na podstawie analizy technicznej."""
     try:
-        # Konwertuj dane na DataFrame
-        df = pd.DataFrame(historical_data)
-            
-        # Oblicz wskaźniki techniczne
-        rsi = calculate_rsi(df['price'].values)
-        macd, macd_signal, macd_hist = calculate_macd(df['price'].values)
-        ma_short, ma_long = calculate_moving_averages(df['price'].values)
-        
-        # Sprawdź czy wszystkie wskaźniki są dostępne
-        if rsi is None or macd is None or macd_signal is None or ma_short is None or ma_long is None:
+        if historical_data is None or len(historical_data) < 24:
+            logging.info("Za mało danych historycznych do analizy")
             return False
             
-        # Pobierz ostatnie wartości cen
-        last_price = float(df['price'].iloc[-1])
-        prev_price = float(df['price'].iloc[-2])
+        # Oblicz wskaźniki techniczne
+        rsi = calculate_rsi(historical_data)
+        macd, signal, hist = calculate_macd(historical_data)
+        ma_short, ma_long = calculate_moving_averages(historical_data)
         
-        # Sprawdź czy cena rośnie
-        if last_price > prev_price:
-            # Sprawdź czy RSI jest w odpowiednim zakresie
-            if 30 <= rsi <= 70:
-                # Sprawdź czy MACD jest dodatni
-                if macd > 0:
-                    # Sprawdź czy MACD rośnie
-                    if macd > macd_signal:
-                        # Sprawdź czy MACD rośnie szybciej niż sygnał
-                        if (macd - macd_signal) > 0:
-                            return True
+        if macd is None or ma_short is None:
+            logging.info("Nie można obliczyć wskaźników technicznych")
+            return False
+            
+        # Konwertuj wartości na float
+        current_price = float(current_price)
+        
+        # Loguj wskaźniki
+        logging.info(f"RSI: {rsi:.2f}")
+        logging.info(f"MACD: {macd:.2f}, Signal: {signal:.2f}, Hist: {hist:.2f}")
+        logging.info(f"MA20: {ma_short:.2f}, MA50: {ma_long:.2f}")
+        
+        # Oblicz zmienność ceny
+        price_volatility = calculate_volatility(historical_data)
+        logging.info(f"Zmienność ceny: {price_volatility:.2f}%")
+        
+        # Bardzo selektywne warunki kupna - tylko silne sygnały
+        if (current_price > ma_short and rsi < 45 and macd > signal and hist > 0) or \
+           (current_price > ma_long and rsi < 40 and price_volatility > 0.5) or \
+           (current_price > ma_short and hist > 0 and rsi < 50 and price_volatility > 0.3):
+            logging.info("SILNY SYGNAŁ KUPNA - Wykryto potencjalny wzrost")
+            return True
+            
+        # Bardzo selektywne warunki sprzedaży - tylko przy pewnych sygnałach
+        if (current_price < ma_short and rsi > 55) or \
+           (current_price < ma_long and rsi > 50) or \
+           (current_price < ma_short and hist < 0 and rsi > 45 and price_volatility > 0.8):
+            logging.info("SILNY SYGNAŁ SPRZEDAŻY - Realizacja zysku lub ograniczenie straty")
+            return True
+            
         return False
         
     except Exception as e:
-        logger.error(f"Błąd podczas analizy warunków handlowych: {e}")
+        logging.error(f"Błąd podczas analizy warunków handlowych: {e}")
         return False
 
 def init_ai_model():
@@ -565,46 +554,26 @@ def predict_price(model, X, scaler):
 
 def analyze_market_trend(historical_data):
     """Analizuj trend rynkowy."""
-    try:
-        if historical_data is None or (isinstance(historical_data, pd.DataFrame) and historical_data.empty) or len(historical_data) < 24:
-            return "neutral"
+    if historical_data is None or historical_data.empty:
+        return "neutral"
     
-        # Sprawdź czy historical_data jest DataFrame i konwertuj na numpy array
-        if isinstance(historical_data, pd.DataFrame):
-            prices = historical_data['price'].values
-        else:
-            prices = np.array(historical_data)
-            
-        if len(prices) == 0:
-            return "neutral"
-            
-        # Upewnij się, że wszystkie wartości są float
-        current_price = float(prices[-1])
-        
+    try:
         # Oblicz wskaźniki techniczne
-        ma_short, ma_long = calculate_moving_averages(prices)
-        rsi = calculate_rsi(prices)
+        current_price = float(historical_data['price'].iloc[-1])
+        ma_short, ma_long = calculate_moving_averages(historical_data['price'])
+        rsi = calculate_rsi(historical_data['price'])
         
-        # Sprawdź czy wartości nie są None
-        if ma_short is None or ma_long is None or rsi is None:
+        # Sprawdź czy wartości nie są NaN
+        if any(pd.isna(x) for x in [current_price, ma_short, ma_long, rsi]):
             return "neutral"
-        
-        # Konwertuj wartości na float
-        ma_short = float(ma_short)
-        ma_long = float(ma_long)
-        rsi = float(rsi)
         
         # Analiza trendu na podstawie wielu wskaźników
-        trend_bullish = current_price > ma_short and ma_short > ma_long and rsi > 50
-        trend_bearish = current_price < ma_short and ma_short < ma_long and rsi < 50
-        
-        if trend_bullish:
+        if current_price > ma_short and ma_short > ma_long and rsi > 50:
             return "bullish"
-        elif trend_bearish:
+        elif current_price < ma_short and ma_short < ma_long and rsi < 50:
             return "bearish"
         else:
             return "neutral"
-            
     except Exception as e:
         logger.error(f"Błąd podczas analizy trendu: {e}")
         return "neutral"
@@ -612,10 +581,6 @@ def analyze_market_trend(historical_data):
 def suggest_thresholds(current_price, trend, predicted_price=None):
     """Sugeruj progi kupna/sprzedaży na podstawie analizy AI."""
     try:
-        # Upewnij się, że trend jest stringiem
-        if not isinstance(trend, str):
-            trend = "neutral"
-            
         if predicted_price:
             # Jeśli mamy przewidywanie ceny, użyj go do ustawienia progów
             price_range = abs(predicted_price - current_price)
@@ -705,23 +670,23 @@ def check_total_exposure():
         for pair in TRADING_PAIRS:
             if pair not in market_data:
                 continue
-            
+                
             trade_history = market_data[pair]['trade_history']
             if not trade_history:
                 continue
-            
+                
             # Znajdź ostatnią transakcję kupna
             last_buy = None
             for trade in reversed(trade_history):
                 if trade['type'] == 'buy':
                     last_buy = trade
                     break
-            
+                    
             if last_buy:
                 # Oblicz wartość pozycji
                 position_value = float(last_buy['amount']) * float(last_buy['price'])
                 total_exposure += position_value
-            
+                
         return total_exposure
         
     except Exception as e:
@@ -763,51 +728,38 @@ def can_open_new_position():
 def calculate_profit_target(product_id, historical_data):
     """Oblicza dynamiczny cel zysku na podstawie analizy rynku."""
     try:
-        if historical_data is None or (isinstance(historical_data, pd.DataFrame) and historical_data.empty) or len(historical_data) < 24:
-            return MIN_PROFIT_TARGET
-            
-        # Sprawdź czy historical_data jest DataFrame i konwertuj na numpy array
-        if isinstance(historical_data, pd.DataFrame):
-            prices = historical_data['price'].values
-        else:
-            prices = np.array(historical_data)
-            
-        if len(prices) == 0:
+        if historical_data is None or len(historical_data) < 24:
             return MIN_PROFIT_TARGET
             
         # Oblicz zmienność ceny
-        volatility = calculate_volatility(prices)
+        volatility = calculate_volatility(historical_data)
         
         # Oblicz siłę trendu
-        rsi = calculate_rsi(prices)
-        macd, signal, hist = calculate_macd(prices)
-        ma_short, ma_long = calculate_moving_averages(prices)
+        rsi = calculate_rsi(historical_data)
+        macd, signal, hist = calculate_macd(historical_data)
+        ma_short, ma_long = calculate_moving_averages(historical_data)
         
-        if macd is None or ma_short is None or rsi is None:
+        if macd is None or ma_short is None:
             return MIN_PROFIT_TARGET
             
         # Określ siłę trendu
         trend_strength = 1.0
-        current_price = float(prices[-1])
-        ma_short = float(ma_short)
-        ma_long = float(ma_long)
-        
-        if bool(current_price > ma_short and ma_short > ma_long):
+        if current_price > ma_short and ma_short > ma_long:
             trend_strength = TREND_STRENGTH_MULTIPLIER
-        elif bool(current_price < ma_short and ma_short < ma_long):
+        elif current_price < ma_short and ma_short < ma_long:
             trend_strength = 0.5
             
         # Oblicz cel zysku na podstawie zmienności i trendu
-        profit_target = float(volatility) * VOLATILITY_MULTIPLIER * trend_strength
+        profit_target = volatility * VOLATILITY_MULTIPLIER * trend_strength
         
         # Ogranicz cel zysku do rozsądnych wartości
         profit_target = max(MIN_PROFIT_TARGET, min(profit_target, MAX_PROFIT_TARGET))
         
-        logging.info(f"Obliczony cel zysku dla {product_id}: {profit_target:.2f}% (zmienność: {volatility:.2f}%, siła trendu: {trend_strength:.2f})")
+        logger.info(f"Obliczony cel zysku dla {product_id}: {profit_target:.2f}% (zmienność: {volatility:.2f}%, siła trendu: {trend_strength:.2f})")
         return profit_target
         
     except Exception as e:
-        logging.error(f"Błąd podczas obliczania celu zysku: {e}")
+        logger.error(f"Błąd podczas obliczania celu zysku: {e}")
         return MIN_PROFIT_TARGET
 
 def should_take_profit(product_id, current_price, historical_data):
@@ -833,35 +785,628 @@ def should_take_profit(product_id, current_price, historical_data):
             return True
             
         # Sprawdź czy trend się odwraca
-        if historical_data is None or (isinstance(historical_data, pd.DataFrame) and historical_data.empty):
-            return False
+        rsi = calculate_rsi(historical_data)
+        macd, signal, hist = calculate_macd(historical_data)
         
-        if isinstance(historical_data, pd.DataFrame):
-            prices = historical_data['price'].values
-        else:
-            prices = np.array(historical_data)
-            
-        if len(prices) == 0:
-            return False
-            
-        rsi = calculate_rsi(prices)
-        macd, signal, hist = calculate_macd(prices)
+        # Konwertuj wskaźniki na float
+        rsi = float(rsi.iloc[-1]) if hasattr(rsi, 'iloc') else float(rsi[-1])
+        hist = float(hist.iloc[-1]) if hasattr(hist, 'iloc') else float(hist[-1])
         
-        if rsi is None or macd is None or hist is None:
-            return False
-            
-        # Konwertuj wartości na float
-        rsi = float(rsi)
-        hist = float(hist)
-        
-        if bool(price_change_percent > 0 and rsi > 70 and hist < 0):
+        if price_change_percent > 0 and rsi > 70 and hist < 0:
             logging.info(f"Trend się odwraca - realizacja zysku {price_change_percent:.2f}% dla {product_id}")
             return True
-                
+            
         return False
         
     except Exception as e:
         logging.error(f"Błąd podczas sprawdzania realizacji zysku: {e}")
+        return False
+
+def check_stop_loss_take_profit(product_id, current_price):
+    """Sprawdza warunki stop-loss i take-profit dla danej pozycji."""
+    try:
+        if product_id not in market_data:
+            return False
+            
+        last_buy_price = market_data[product_id].get('last_buy_price')
+        if not last_buy_price:
+            return False
+            
+        # Konwertuj wartości na float
+        current_price = float(current_price)
+        last_buy_price = float(last_buy_price)
+            
+        # Pobierz dane historyczne
+        historical_data = market_data[product_id].get('price_history')
+        
+        # Sprawdź stop-loss
+        price_change_percent = ((current_price - last_buy_price) / last_buy_price) * 100
+        if price_change_percent <= -STOP_LOSS_PERCENT:
+            logging.info(f"STOP-LOSS dla {product_id} przy cenie {current_price} (zmiana: {price_change_percent:.2f}%)")
+            return True
+            
+        # Sprawdź dynamiczny take-profit
+        if should_take_profit(product_id, current_price, historical_data):
+            return True
+            
+        # Sprawdź trailing stop
+        highest_price = market_data[product_id].get('highest_price', last_buy_price)
+        highest_price = float(highest_price)
+        
+        if current_price > highest_price:
+            market_data[product_id]['highest_price'] = current_price
+        elif current_price < highest_price * (1 - TRAILING_STOP_PERCENT/100):
+            logging.info(f"TRAILING-STOP dla {product_id} przy cenie {current_price} (najwyższa: {highest_price})")
+            return True
+            
+        return False
+    except Exception as e:
+        logging.error(f"Błąd podczas sprawdzania stop-loss/take-profit: {e}")
+        return False
+
+def get_available_capital_for_pair(product_id):
+    """Oblicza dostępny kapitał dla danej pary handlowej."""
+    try:
+        total_capital = get_usdc_balance()
+        allocation = CAPITAL_ALLOCATION.get(product_id, 0)
+        return total_capital * allocation
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania dostępnego kapitału: {e}")
+        return 0
+
+def can_trade_today(product_id):
+    """Sprawdza czy można handlować daną parą dzisiaj."""
+    try:
+        if product_id not in market_data:
+            return True
+            
+        trade_history = market_data[product_id]['trade_history']
+        if not trade_history:
+            return True
+            
+        # Sprawdź liczbę transakcji dzisiaj
+        today = datetime.utcnow().date()
+        today_trades = 0
+        
+        for trade in trade_history:
+            if not isinstance(trade['timestamp'], datetime):
+                continue
+                
+            trade_date = trade['timestamp'].date()
+            if trade_date == today:
+                today_trades += 1
+                
+        if today_trades >= MAX_TRADES_PER_DAY:
+            logger.warning(f"Przekroczono dzienny limit transakcji dla {product_id}: {today_trades} (limit: {MAX_TRADES_PER_DAY})")
+            return False
+            
+        return True
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas sprawdzania możliwości handlu dzisiaj: {e}")
+        return False
+
+def calculate_trade_size(product_id, current_price, sentiment):
+    """Oblicza optymalną wielkość zlecenia na podstawie dostępnych środków."""
+    try:
+        # Pobierz dostępne środki
+        if product_id.endswith('USDC'):
+            available_capital = get_available_balance('USDC')
+        else:
+            available_capital = get_available_balance('USD')
+            
+        # Pobierz historię transakcji
+        trade_history = market_data[product_id]['trade_history']
+        
+        # Oblicz dzienny P&L
+        daily_pnl = 0
+        today = datetime.utcnow().date()
+        for trade in trade_history:
+            if trade['timestamp'].date() == today:
+                if trade['type'] == 'sell':
+                    daily_pnl += (trade['price'] - market_data[product_id]['last_buy_price']) * trade['amount']
+                else:
+                    daily_pnl -= trade['price'] * trade['amount']
+        
+        # Dostosuj rozmiar pozycji na podstawie sentymentu
+        base_size = min(available_capital * 0.2, MAX_POSITION_SIZE)  # Maksymalnie 20% dostępnych środków
+        
+        # Zmniejsz rozmiar jeśli sentyment jest negatywny
+        if sentiment < -0.5:
+            base_size *= 0.5
+        elif sentiment < 0:
+            base_size *= 0.75
+            
+        # Zmniejsz rozmiar jeśli dzienny P&L jest ujemny
+        if daily_pnl < 0:
+            base_size *= 0.5
+            
+        # Sprawdź minimalny rozmiar zlecenia
+        min_size = MIN_ORDER_SIZE_USDC.get(product_id, 10.0)
+        if base_size < min_size:
+            logger.info(f"Za mało kapitału na zlecenie dla {product_id} (min: {min_size} USDC)")
+            return 0
+            
+        return base_size
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania rozmiaru pozycji: {e}")
+        return 0
+
+def place_buy_order(product_id, amount, price):
+    """Złóż zlecenie kupna dla danej pary."""
+    try:
+        if not can_open_new_position():
+            logger.info("Nie można otworzyć nowej pozycji - przekroczono maksymalną ekspozycję")
+            return None
+            
+        if not can_trade_today(product_id):
+            logger.info(f"Osiągnięto dzienny limit transakcji dla {product_id}")
+            return None
+            
+        # Sprawdź dostępne środki
+        if product_id.endswith('USDC'):
+            available_capital = get_available_balance('USDC')
+        else:
+            available_capital = get_available_balance('USD')
+            
+        if available_capital < amount:
+            logger.info(f"Za mało dostępnych środków: {available_capital} < {amount}")
+            return None
+            
+        trade_size = calculate_trade_size(product_id, price, 0)  # Domyślny sentyment 0
+        if trade_size == 0:
+            logger.info(f"Za mało kapitału na zlecenie dla {product_id}")
+            return None
+            
+        crypto_amount = trade_size / price
+        logger.info(f"Próba złożenia zlecenia kupna dla {product_id}: {crypto_amount} {product_id.split('-')[0]} (wartość: {trade_size} USDC)")
+        
+        order = client.create_order(
+            client_order_id=str(int(time.time() * 1000)),
+            product_id=product_id,
+            side="BUY",
+            order_configuration={
+                "market_market_ioc": {
+                    "quote_size": str(trade_size)
+                }
+            }
+        )
+        
+        market_data[product_id]['last_buy_price'] = price
+        market_data[product_id]['highest_price'] = price
+        market_data[product_id]['trade_history'].append({
+            'type': 'buy',
+            'price': price,
+            'amount': crypto_amount,
+            'timestamp': datetime.utcnow()
+        })
+        save_trade_history()
+        logger.info(f"Złożono zlecenie kupna dla {product_id}: {order}")
+        return order
+    except Exception as e:
+        logger.error(f"Błąd podczas składania zlecenia kupna dla {product_id}: {e}")
+        raise
+
+def place_sell_order(product_id, amount, price):
+    """Złóż zlecenie sprzedaży dla danej pary."""
+    try:
+        order = client.create_order(
+            client_order_id=str(int(time.time() * 1000)),
+            product_id=product_id,
+            side="SELL",
+            order_configuration={
+                "market_market_ioc": {
+                    "base_size": str(amount)
+                }
+            }
+        )
+        market_data[product_id]['last_sell_price'] = price
+        market_data[product_id]['trade_history'].append({
+            'type': 'sell',
+            'price': price,
+            'amount': amount,
+            'timestamp': datetime.utcnow()
+        })
+        save_trade_history()  # Zapisz zmiany po każdej transakcji
+        logger.info(f"Złożono zlecenie sprzedaży dla {product_id}: {order}")
+        return order
+    except Exception as e:
+        logger.error(f"Błąd podczas składania zlecenia sprzedaży dla {product_id}: {e}")
+        raise
+
+def get_all_balances():
+    """Pobierz wszystkie salda konta."""
+    try:
+        accounts = client.get_accounts().accounts
+        balances = {}
+        for account in accounts:
+            if hasattr(account, 'available_balance') and account.available_balance:
+                currency = account.currency
+                # Sprawdź czy waluta jest obsługiwana
+                if currency not in ['USDC', 'USD', 'BTC', 'ETH']:
+                    continue
+                    
+                # Obsługa różnych formatów danych
+                if isinstance(account.available_balance, dict):
+                    available = float(account.available_balance.get('value', 0))
+                else:
+                    available = float(account.available_balance.value)
+                
+                if hasattr(account, 'total_balance'):
+                    if isinstance(account.total_balance, dict):
+                        total = float(account.total_balance.get('value', 0))
+                    else:
+                        total = float(account.total_balance.value)
+                else:
+                    total = available
+                
+                if hasattr(account, 'hold'):
+                    if isinstance(account.hold, dict):
+                        hold = float(account.hold.get('value', 0))
+                    else:
+                        hold = float(account.hold.value)
+                else:
+                    hold = 0
+
+                balances[currency] = {
+                    'available': available,
+                    'total': total,
+                    'hold': hold,
+                    'currency': currency,
+                    'type': getattr(account, 'type', 'unknown'),
+                    'active': getattr(account, 'active', True)
+                }
+        return balances
+    except Exception as e:
+        logger.error(f"Błąd podczas pobierania sald: {e}")
+        raise
+
+def print_detailed_balances():
+    """Wyświetla szczegółowe informacje o saldach konta."""
+    try:
+        print("\n=== SPRAWDZANIE SALD KONTA ===")
+        print("Pobieranie danych...")
+        
+        balances = get_all_balances()
+        if not balances:
+            print("Nie udało się pobrać sald - brak danych")
+            return
+            
+        print("\n{:<10} {:<15} {:<15} {:<15} {:<15}".format(
+            "Waluta", "Dostępne", "Całkowite", "Zablokowane", "Stakowane"
+        ))
+        print("-" * 75)
+        
+        total_value_usdc = 0
+        
+        for currency, data in balances.items():
+            try:
+                available = float(data['available'])
+                total = float(data['total'])
+                hold = float(data['hold'])
+                staked = float(data['staked'])
+                
+                # Jeśli to nie USDC, sprawdź czy para handlowa istnieje
+                if currency != 'USDC':
+                    pair = f"{currency}-USDC"
+                    if pair in TRADING_PAIRS:
+                        try:
+                            current_price = get_product_ticker(pair)
+                            if current_price is not None:
+                                value_usdc = total * current_price
+                                total_value_usdc += value_usdc
+                            else:
+                                value_usdc = 0
+                        except:
+                            value_usdc = 0
+                    else:
+                        value_usdc = 0
+                else:
+                    value_usdc = total
+                    total_value_usdc += value_usdc
+                
+                print("{:<10} {:<15.8f} {:<15.8f} {:<15.8f} {:<15.8f}".format(
+                    currency,
+                    available,
+                    total,
+                    hold,
+                    staked
+                ))
+                
+                if currency != 'USDC' and value_usdc > 0:
+                    print(f"Wartość w USDC: {value_usdc:.2f}")
+                    
+            except Exception as e:
+                print(f"Błąd przy przetwarzaniu salda {currency}: {e}")
+                continue
+        
+        print("\n=== PODSUMOWANIE ===")
+        print(f"Całkowita wartość w USDC: {total_value_usdc:.2f}")
+        print("=========================")
+        
+    except Exception as e:
+        print(f"Błąd podczas pobierania sald: {str(e)}")
+        print(f"Typ błędu: {type(e).__name__}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+
+def get_transaction_history(product_id):
+    """Pobiera historię transakcji dla danej pary."""
+    try:
+        logger.info(f"\n=== HISTORIA TRANSAKCJI DLA {product_id} ===")
+        logger.info("Pobieranie danych...")
+        
+        fills = client.get_fills(product_id=product_id, limit=100)
+        if not fills or not hasattr(fills, 'fills'):
+            logger.info("Brak historii transakcji")
+            return []
+            
+        if not fills.fills:
+            logger.info("Brak transakcji dla tej pary")
+            return []
+            
+        logger.info(f"\nZnaleziono {len(fills.fills)} transakcji:")
+        logger.info("\n{:<20} {:<10} {:<15} {:<15} {:<15} {:<10}".format(
+            "Data", "Typ", "Cena", "Ilość", "Wartość", "Opłata"
+        ))
+        logger.info("-" * 90)
+        
+        transactions = []
+        for fill in fills.fills:
+            try:
+                timestamp = getattr(fill, 'trade_time', None)
+                if timestamp is None:
+                    continue
+                    
+                typ = 'BUY' if getattr(fill, 'side', '-') == 'BUY' else 'SELL'
+                cena = float(getattr(fill, 'price', 0))
+                ilosc = float(getattr(fill, 'size', 0))
+                wartosc = cena * ilosc
+                oplata = getattr(fill, 'fee', '0')
+                
+                transaction = {
+                    'timestamp': timestamp,
+                    'type': typ,
+                    'price': cena,
+                    'amount': ilosc,
+                    'value': wartosc,
+                    'fee': oplata
+                }
+                transactions.append(transaction)
+                
+                logger.info("{:<20} {:<10} {:<15.8f} {:<15.8f} {:<15.2f} {:<10}".format(
+                    str(timestamp),
+                    typ,
+                    cena,
+                    ilosc,
+                    wartosc,
+                    str(oplata)
+                ))
+            except Exception as e:
+                logger.error(f"Błąd przy przetwarzaniu transakcji: {e}")
+                continue
+                
+        logger.info("\n=========================")
+        return transactions
+    except Exception as e:
+        logger.error(f"Błąd podczas pobierania historii transakcji dla {product_id}: {e}")
+        return []
+
+def get_authenticated_client():
+    """Tworzy i zwraca uwierzytelnionego klienta Coinbase."""
+    try:
+        # Wczytaj klucze API z pliku
+        with open('cdp_api_key.json', 'r') as f:
+            api_keys = json.load(f)
+            api_key = api_keys['api_key_id']
+            api_secret = api_keys['api_key_secret']
+        
+        # Utwórz klienta z kluczami API
+        client = RESTClient(api_key=api_key, api_secret=api_secret)
+        return client
+    except Exception as e:
+        logger.error(f"Błąd podczas tworzenia klienta: {str(e)}")
+        return None
+
+def save_trade_history():
+    """Zapisuje historię transakcji do pliku."""
+    try:
+        with open('trade_history.json', 'w') as f:
+            json.dump(market_data, f, default=str)
+        logger.info("Zapisano historię transakcji")
+    except Exception as e:
+        logger.error(f"Błąd podczas zapisywania historii transakcji: {e}")
+
+def load_trade_history():
+    """Wczytuje historię transakcji z pliku."""
+    try:
+        if os.path.exists('trade_history.json'):
+            with open('trade_history.json', 'r') as f:
+                data = json.load(f)
+                for pair in TRADING_PAIRS:
+                    if pair in data:
+                        market_data[pair]['trade_history'] = data[pair]['trade_history']
+                        # Konwertuj stringi timestampów z powrotem na obiekty datetime
+                        for trade in market_data[pair]['trade_history']:
+                            trade['timestamp'] = datetime.fromisoformat(trade['timestamp'])
+            logger.info("Wczytano historię transakcji")
+            return data
+        return {}
+    except Exception as e:
+        logger.error(f"Błąd podczas wczytywania historii transakcji: {e}")
+        return {}
+
+def get_product_candles(product_id, start, end, granularity):
+    """Pobiera świeczki dla danej pary handlowej."""
+    try:
+        # Konwertuj daty na timestamp w sekundach
+        start_timestamp = int(start.timestamp())
+        end_timestamp = int(end.timestamp())
+        
+        # Użyj prawidłowej metody API
+        response = client.get_candles(
+            product_id=product_id,
+            start=start_timestamp,
+            end=end_timestamp,
+            granularity=granularity
+        )
+        
+        if not response or not hasattr(response, 'candles'):
+            logger.warning(f"Brak danych świeczek dla {product_id}")
+            return None
+            
+        return response.candles
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas pobierania świeczek dla {product_id}: {e}")
+        return None
+
+def calculate_market_sentiment(product_id):
+    """Analizuje sentyment rynku na podstawie różnych wskaźników."""
+    try:
+        historical_data = get_historical_data(product_id)
+        if historical_data is None or len(historical_data) < 50:
+            return 0
+
+        # Oblicz wskaźniki
+        rsi = calculate_rsi(historical_data['price'])
+        macd, signal, hist = calculate_macd(historical_data['price'])
+        ma20, ma50 = calculate_moving_averages(historical_data['price'])
+        volatility = calculate_volatility(historical_data)
+        
+        # Konwertuj wskaźniki na float
+        rsi = float(rsi.iloc[-1]) if hasattr(rsi, 'iloc') else float(rsi[-1])
+        macd = float(macd.iloc[-1]) if hasattr(macd, 'iloc') else float(macd[-1])
+        signal = float(signal.iloc[-1]) if hasattr(signal, 'iloc') else float(signal[-1])
+        ma20 = float(ma20.iloc[-1]) if hasattr(ma20, 'iloc') else float(ma20[-1])
+        ma50 = float(ma50.iloc[-1]) if hasattr(ma50, 'iloc') else float(ma50[-1])
+        volatility = float(volatility.iloc[-1]) if hasattr(volatility, 'iloc') else float(volatility[-1])
+        
+        # Oblicz głębokość rynku
+        market_depth = calculate_market_depth(product_id)
+        if market_depth:
+            depth_ratio = float(market_depth['ratio'])
+        else:
+            depth_ratio = 1.0
+
+        # Oblicz sentyment (wartość od -1 do 1)
+        sentiment = 0
+        
+        # RSI contribution
+        if rsi < 30:
+            sentiment += 0.2
+        elif rsi > 70:
+            sentiment -= 0.2
+            
+        # MACD contribution
+        if macd > signal:
+            sentiment += 0.2
+        else:
+            sentiment -= 0.2
+            
+        # Moving Averages contribution
+        if ma20 > ma50:
+            sentiment += 0.2
+        else:
+            sentiment -= 0.2
+            
+        # Volatility contribution
+        if volatility < 1.0:  # Niska zmienność
+            sentiment += 0.1
+        elif volatility > 3.0:  # Wysoka zmienność
+            sentiment -= 0.1
+            
+        # Market depth contribution
+        if depth_ratio > 1.2:  # Więcej kupujących
+            sentiment += 0.2
+        elif depth_ratio < 0.8:  # Więcej sprzedających
+            sentiment -= 0.2
+            
+        return sentiment
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania sentymentu rynku: {e}")
+        return 0
+
+def calculate_position_size(product_id, current_price, sentiment):
+    """Oblicza optymalny rozmiar pozycji na podstawie sentymentu i zarządzania ryzykiem."""
+    try:
+        # Pobierz dostępny kapitał dla pary
+        available_capital = get_available_capital_for_pair(product_id)
+        
+        # Pobierz historię transakcji
+        trade_history = market_data[product_id]['trade_history']
+        
+        # Oblicz dzienny P&L
+        daily_pnl = 0
+        today = datetime.utcnow().date()
+        for trade in trade_history:
+            trade_date = datetime.strptime(trade['timestamp'], '%Y-%m-%d %H:%M:%S.%f').date()
+            if trade_date == today:
+                if trade['type'] == 'sell':
+                    daily_pnl += (trade['price'] - market_data[product_id]['last_buy_price']) * trade['amount']
+                else:
+                    daily_pnl -= trade['price'] * trade['amount']
+        
+        # Dostosuj rozmiar pozycji na podstawie sentymentu
+        base_size = TRADE_VALUE_USDC
+        
+        # Zmniejsz rozmiar jeśli sentyment jest negatywny
+        if sentiment < -0.5:
+            base_size *= 0.5
+        elif sentiment < 0:
+            base_size *= 0.75
+            
+        # Zmniejsz rozmiar jeśli dzienny P&L jest ujemny
+        if daily_pnl < 0:
+            base_size *= 0.5
+            
+        # Sprawdź maksymalny rozmiar pozycji
+        max_size = min(available_capital, MAX_POSITION_SIZE)
+        
+        # Zwróć mniejszą z wartości
+        return min(base_size, max_size)
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania rozmiaru pozycji: {e}")
+        return MIN_TRADE_SIZE_USDC
+
+def implement_trailing_stop(product_id, current_price):
+    """Implementuje trailing stop dla otwartych pozycji."""
+    try:
+        trade_history = market_data[product_id]['trade_history']
+        if not trade_history:
+            return False
+            
+        # Znajdź ostatnią transakcję kupna
+        last_buy = None
+        for trade in reversed(trade_history):
+            if trade['type'] == 'buy':
+                last_buy = trade
+                break
+                
+        if not last_buy:
+            return False
+            
+        # Oblicz zysk
+        profit_percent = (current_price - last_buy['price']) / last_buy['price'] * 100
+        
+        # Jeśli zysk przekracza trailing stop, zaktualizuj stop loss
+        if profit_percent > TRAILING_STOP_PERCENT:
+            new_stop_price = current_price * (1 - TRAILING_STOP_PERCENT/100)
+            
+            # Jeśli cena spadła poniżej nowego stop loss, sprzedaj
+            if current_price < new_stop_price:
+                amount = last_buy['amount']
+                place_sell_order(product_id, amount, current_price)
+                logger.info(f"Wykonano trailing stop dla {product_id} przy cenie {current_price}")
+                return True
+                
+        return False
+        
+    except Exception as e:
+        logger.error(f"Błąd podczas implementacji trailing stop: {e}")
         return False
 
 def analyze_correlation():
@@ -909,19 +1454,18 @@ def analyze_market_conditions():
             historical_data = get_historical_data(pair)
             if historical_data is not None and not historical_data.empty:
                 # Oblicz zmienność
-                volatility = calculate_volatility(historical_data['price'].values)
-                market_conditions['volatility'][pair] = float(volatility)
+                volatility = calculate_volatility(historical_data)
+                if hasattr(volatility, 'iloc'):
+                    volatility = float(volatility.iloc[-1])
+                market_conditions['volatility'][pair] = volatility
                 
                 # Analizuj trend
                 trend = analyze_market_trend(historical_data)
-                if isinstance(trend, str):  # Upewnij się, że trend jest stringiem
-                    market_conditions['trend'][pair] = trend
-                else:
-                    market_conditions['trend'][pair] = "neutral"
+                market_conditions['trend'][pair] = trend
                 
                 # Oblicz sentyment
                 sentiment = calculate_market_sentiment(pair)
-                market_conditions['sentiment'][pair] = float(sentiment)
+                market_conditions['sentiment'][pair] = sentiment
                 
         # Analizuj korelacje
         market_conditions['correlation'] = analyze_correlation()
@@ -939,7 +1483,12 @@ def analyze_market_conditions():
         
     except Exception as e:
         logger.error(f"Błąd podczas analizy warunków rynkowych: {e}")
-        return None
+        logger.error(f"Błąd w głównej pętli: {str(e)}")
+        time.sleep(60)
+        
+    except Exception as e:
+        logger.error(f"Krytyczny błąd: {str(e)}")
+        raise
 
 def check_buy_conditions(product_id):
     """Sprawdza warunki kupna dla danej pary."""
@@ -970,32 +1519,22 @@ def check_buy_conditions(product_id):
             return False
             
         # Oblicz wskaźniki techniczne
-        prices = historical_data['price'].values
-        rsi = calculate_rsi(prices)
-        macd, signal, hist = calculate_macd(prices)
-        ma_short, ma_long = calculate_moving_averages(prices)
-        volatility = calculate_volatility(prices)
-        
-        # Konwertuj wartości na float
-        rsi = float(rsi) if rsi is not None else None
-        macd = float(macd) if macd is not None else None
-        signal = float(signal) if signal is not None else None
-        hist = float(hist) if hist is not None else None
-        ma_short = float(ma_short) if ma_short is not None else None
-        ma_long = float(ma_long) if ma_long is not None else None
-        volatility = float(volatility) if volatility is not None else None
+        rsi = calculate_rsi(historical_data)
+        macd = calculate_macd(historical_data)
+        ma_short = calculate_moving_average(historical_data, 20)
+        ma_long = calculate_moving_average(historical_data, 50)
+        volatility = calculate_volatility(historical_data)
         
         # Sprawdź warunki kupna
-        if rsi is not None and rsi < 30:  # Przesprzedany
+        if rsi < 30:  # Przesprzedany
             logger.info(f"RSI wskazuje na przesprzedanie: {rsi}")
             return True
             
-        if macd is not None and signal is not None and ma_short is not None and ma_long is not None:
-            if bool(macd > signal and ma_short > ma_long):  # Trend wzrostowy
-                logger.info("Wskaźniki wskazują na trend wzrostowy")
-                return True
+        if macd > 0 and ma_short > ma_long:  # Trend wzrostowy
+            logger.info("Wskaźniki wskazują na trend wzrostowy")
+            return True
             
-        if volatility is not None and volatility < MAX_VOLATILITY * 0.5:  # Niska zmienność
+        if volatility < MAX_VOLATILITY * 0.5:  # Niska zmienność
             logger.info(f"Zmienność jest akceptowalna: {volatility}")
             return True
             
@@ -1034,32 +1573,22 @@ def check_sell_conditions(product_id):
             return False
             
         # Oblicz wskaźniki techniczne
-        prices = historical_data['price'].values
-        rsi = calculate_rsi(prices)
-        macd, signal, hist = calculate_macd(prices)
-        ma_short, ma_long = calculate_moving_averages(prices)
-        volatility = calculate_volatility(prices)
-        
-        # Konwertuj wartości na float
-        rsi = float(rsi) if rsi is not None else None
-        macd = float(macd) if macd is not None else None
-        signal = float(signal) if signal is not None else None
-        hist = float(hist) if hist is not None else None
-        ma_short = float(ma_short) if ma_short is not None else None
-        ma_long = float(ma_long) if ma_long is not None else None
-        volatility = float(volatility) if volatility is not None else None
+        rsi = calculate_rsi(historical_data)
+        macd = calculate_macd(historical_data)
+        ma_short = calculate_moving_average(historical_data, 20)
+        ma_long = calculate_moving_average(historical_data, 50)
+        volatility = calculate_volatility(historical_data)
         
         # Sprawdź warunki sprzedaży
-        if rsi is not None and rsi > 70:  # Przesprzedany
+        if rsi > 70:  # Przesprzedany
             logger.info(f"RSI zbyt wysoki: {rsi}")
             return True
             
-        if macd is not None and signal is not None and ma_short is not None and ma_long is not None:
-            if bool(macd < signal and ma_short < ma_long):  # Trend spadkowy
-                logger.info("Wskaźniki wskazują na trend spadkowy")
-                return True
+        if macd < 0 and ma_short < ma_long:  # Trend spadkowy
+            logger.info("Wskaźniki wskazują na trend spadkowy")
+            return True
             
-        if volatility is not None and volatility > MAX_VOLATILITY:  # Wysoka zmienność
+        if volatility > MAX_VOLATILITY:  # Wysoka zmienność
             logger.info("Zmienność jest zbyt wysoka")
             return True
             
@@ -1067,44 +1596,6 @@ def check_sell_conditions(product_id):
         
     except Exception as e:
         logger.error(f"Błąd podczas sprawdzania warunków sprzedaży: {e}")
-        return False
-
-def check_all_limits(product_id):
-    """Sprawdza wszystkie limity handlowe dla danej pary."""
-    try:
-        # Sprawdź całkowite narażenie
-        if not check_total_exposure():
-            logger.warning("Przekroczono limit całkowitego narażenia")
-            return False
-            
-        # Sprawdź czy można otworzyć nową pozycję
-        if not can_open_new_position():
-            logger.warning("Nie można otworzyć nowej pozycji")
-            return False
-            
-        # Sprawdź dzienny P&L
-        daily_pnl = check_daily_pnl()
-        pnl_limit = calculate_pnl_limit()
-        if daily_pnl <= -pnl_limit:
-            logger.warning(f"Przekroczono limit dziennego P&L: {daily_pnl} (limit: {pnl_limit})")
-            return False
-            
-        # Sprawdź limit zmienności
-        historical_data = get_historical_data(product_id)
-        if historical_data is None or historical_data.empty:
-            logger.error(f"Brak danych historycznych dla {product_id}")
-            return False
-            
-        volatility = calculate_volatility(historical_data['price'].values)
-        volatility_limit = calculate_volatility_limit()
-        if volatility > volatility_limit:
-            logger.warning(f"Przekroczono limit zmienności: {volatility} (limit: {volatility_limit})")
-            return False
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"Błąd podczas sprawdzania limitów: {e}")
         return False
 
 def check_trading_conditions(product_id):
@@ -1143,8 +1634,8 @@ def check_trading_conditions(product_id):
             # Jeśli ostatnia transakcja to kupno, sprawdź czy minął wystarczający czas
             if time_since_last_trade.total_seconds() < MIN_HOLDING_TIME:
                 logger.warning(f"Zbyt krótki czas trzymania pozycji: {time_since_last_trade.total_seconds()}s (minimum: {MIN_HOLDING_TIME}s)")
-            return False
-            
+                return False
+                
         return True
         
     except Exception as e:
@@ -1244,7 +1735,7 @@ def check_stop_loss(product_id):
                 
         if not last_buy:
             return True
-                            
+            
         # Pobierz aktualną cenę
         current_price = get_current_price(product_id)
         if not current_price:
@@ -1337,7 +1828,7 @@ def check_trailing_stop(product_id):
             if trade['type'] == 'buy':
                 last_buy = trade
                 break
-                                    
+                
         if not last_buy:
             return True
             
@@ -1363,7 +1854,7 @@ def check_trailing_stop(product_id):
             return True
             
         return False
-                
+        
     except Exception as e:
         logger.error(f"Błąd podczas sprawdzania warunków trailing stop: {e}")
         return False
@@ -1403,148 +1894,14 @@ def check_all_conditions(product_id):
             return False
             
         return True
-                
+        
     except Exception as e:
         logger.error(f"Błąd podczas sprawdzania wszystkich warunków: {e}")
         return False
 
-def check_market_conditions(product_id):
-    """Sprawdza warunki rynkowe dla danej pary."""
-    try:
-        global MAX_VOLATILITY
-        if product_id not in market_data:
-            return True
-            
-        # Pobierz dane historyczne
-        historical_data = get_historical_data(product_id)
-        if historical_data is None or historical_data.empty:
-            logger.error(f"Brak danych historycznych dla {product_id}")
-            return False
-            
-        # Oblicz wskaźniki techniczne
-        prices = historical_data['price'].values
-        rsi = calculate_rsi(prices)
-        macd, signal, hist = calculate_macd(prices)
-        ma_short, ma_long = calculate_moving_averages(prices)
-        volatility = calculate_volatility(prices)
-        
-        # Sprawdź czy wszystkie wskaźniki są dostępne
-        if rsi is None or macd is None or signal is None or ma_short is None or ma_long is None:
-            return False
-            
-        # Sprawdź warunki rynkowe
-        if rsi > 70 or rsi < 30:  # Ekstremalne wartości RSI
-            return False
-            
-        if volatility > MAX_VOLATILITY:  # Zbyt wysoka zmienność
-            return False
-            
-        if macd * signal < 0:  # Konflikt między MACD a sygnałem
-            return False
-            
-        return True
-        
-    except Exception as e:
-        logger.error(f"Błąd podczas sprawdzania warunków rynkowych: {e}")
-        return False
-
-def get_current_price(product_id):
-    """Pobiera aktualną cenę dla danej pary."""
-    try:
-        if product_id not in market_data:
-            return None
-            
-        current_price = market_data[product_id].get('current_price')
-        if current_price is None:
-            # Spróbuj pobrać cenę z API
-            ticker = get_product_ticker(product_id)
-            if ticker:
-                market_data[product_id]['current_price'] = ticker
-                return ticker
-            return None
-            
-        return current_price
-        
-    except Exception as e:
-        logger.error(f"Błąd podczas pobierania aktualnej ceny: {e}")
-        return None
-
-def get_transaction_history(pair):
-    """Pobiera historię transakcji dla danej pary."""
-    try:
-        if pair not in market_data:
-            return []
-            
-        return market_data[pair].get('trade_history', [])
-        
-    except Exception as e:
-        logger.error(f"Błąd podczas pobierania historii transakcji: {e}")
-        return []
-
-def calculate_market_sentiment(pair):
-    """Oblicza sentyment rynkowy dla danej pary."""
-    try:
-        if pair not in market_data:
-            return 0
-            
-        # Pobierz dane historyczne
-        historical_data = get_historical_data(pair)
-        if historical_data is None or historical_data.empty:
-            return 0
-            
-        # Oblicz wskaźniki techniczne
-        prices = historical_data['price'].values
-        rsi = calculate_rsi(prices)
-        macd, signal, hist = calculate_macd(prices)
-        ma_short, ma_long = calculate_moving_averages(prices)
-        
-        if rsi is None or macd is None or signal is None or ma_short is None or ma_long is None:
-            return 0
-            
-        # Oblicz sentyment na podstawie wskaźników
-        sentiment = 0
-        
-        # RSI
-        if rsi > 70:
-            sentiment -= 1
-        elif rsi < 30:
-            sentiment += 1
-            
-        # MACD
-        if macd > signal:
-            sentiment += 1
-        else:
-            sentiment -= 1
-            
-        # Średnie kroczące
-        if ma_short > ma_long:
-            sentiment += 1
-        else:
-            sentiment -= 1
-            
-        return sentiment / 3  # Normalizacja do zakresu [-1, 1]
-        
-    except Exception as e:
-        logger.error(f"Błąd podczas obliczania sentymentu rynkowego: {e}")
-        return 0
-
-def main():
-    logger.info('Uruchamianie bota...')
-    try:
-        ws.connect()
-        while True:
-            for pair in TRADING_PAIRS:
-                if check_all_conditions(pair):
-                    logger.info(f'Warunki handlowe spełnione dla {pair}')
-            time.sleep(TRADE_INTERVAL)
-    except Exception as e:
-        logger.error(f'Krytyczny błąd: {e}')
-    finally:
-        ws.disconnect()
-
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        logger.error(f"Krytyczny błąd: {str(e)}")
-        raise
+    main()
+
+
+
+
