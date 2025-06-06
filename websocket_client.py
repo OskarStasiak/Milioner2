@@ -12,7 +12,7 @@ import base64
 import ssl
 
 class CoinbaseWebSocket:
-    def __init__(self, api_key, api_secret, trading_pairs):
+    def __init__(self, api_key, api_secret, trading_pairs, callback=None):
         """
         Inicjalizacja klienta WebSocket dla Coinbase Advanced.
         
@@ -20,10 +20,12 @@ class CoinbaseWebSocket:
             api_key (str): Klucz API w formacie "organizations/{org_id}/apiKeys/{key_id}"
             api_secret (str): Klucz prywatny w formacie PEM
             trading_pairs (list): Lista par handlowych do subskrypcji (np. ['ETH-USDC', 'BTC-USDC'])
+            callback (function): Funkcja callback do przekazywania danych do głównego bota
         """
         self.api_key = api_key
         self.api_secret = api_secret
         self.trading_pairs = trading_pairs
+        self.callback = callback  # Dodajemy callback
         self.ws = None
         self.connected = False
         self.subscribed_channels = set()  # Zbiór subskrybowanych kanałów
@@ -162,6 +164,11 @@ class CoinbaseWebSocket:
                 if 'asks' in data:
                     self.market_data[product_id]['order_book']['asks'] = data['asks']
                 logging.debug(f"Zaktualizowano order book dla {product_id}")
+                
+                # Przekaż dane do głównego bota przez callback
+                if self.callback:
+                    self.callback(data)
+                    
         except Exception as e:
             logging.error(f"Błąd podczas obsługi danych level2: {e}")
     
@@ -172,6 +179,11 @@ class CoinbaseWebSocket:
             if product_id in self.market_data:
                 self.market_data[product_id]['ticker'] = data
                 logging.debug(f"Zaktualizowano ticker dla {product_id}")
+                
+                # Przekaż dane do głównego bota przez callback
+                if self.callback:
+                    self.callback(data)
+                    
         except Exception as e:
             logging.error(f"Błąd podczas obsługi danych ticker: {e}")
     
@@ -182,6 +194,11 @@ class CoinbaseWebSocket:
             if product_id in self.market_data:
                 self.market_data[product_id]['last_trade'] = data
                 logging.debug(f"Zaktualizowano ostatnią transakcję dla {product_id}")
+                
+                # Przekaż dane do głównego bota przez callback
+                if self.callback:
+                    self.callback(data)
+                    
         except Exception as e:
             logging.error(f"Błąd podczas obsługi danych o transakcjach: {e}")
     

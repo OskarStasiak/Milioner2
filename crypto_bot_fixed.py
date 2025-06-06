@@ -35,6 +35,10 @@ console_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+# Wyczyść plik logów przy starcie
+with open('crypto_bot.log', 'w') as f:
+    f.write('=== NOWA SESJA BOTA ===\n')
+
 # Załaduj zmienne środowiskowe
 load_dotenv('production.env')
 
@@ -45,7 +49,7 @@ with open('cdp_api_key.json', 'r') as f:
     API_SECRET = api_keys['api_key_secret']
 
 # Parametry handlowe
-TRADING_PAIRS = ['ETH-USDC', 'BTC-USDC', 'SOL-USDC', 'DOGE-USDC', 'XRP-USDC', 'MATIC-USDC', 'LINK-USDC']
+TRADING_PAIRS = ['ETH-USD', 'BTC-USD', 'SOL-USD', 'DOGE-USD', 'XRP-USD', 'MATIC-USD', 'LINK-USD']
 TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 50))
 MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 200))
 MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', 0.05))
@@ -60,9 +64,6 @@ TRADE_INTERVAL = int(os.getenv('TRADE_INTERVAL', 30))
 
 # Inicjalizacja API
 client = RESTClient(api_key=API_KEY, api_secret=API_SECRET)
-
-# Inicjalizacja WebSocket dla wszystkich par
-ws = CoinbaseWebSocket(API_KEY, API_SECRET, TRADING_PAIRS)
 
 # Globalne zmienne do przechowywania danych w czasie rzeczywistym
 market_data = {}
@@ -96,7 +97,8 @@ def on_ws_message(data):
                 })
                 if len(market_data[product_id]['price_history']) > 1000:
                     market_data[product_id]['price_history'].pop(0)
-                logging.info(f"Aktualna cena {product_id}: {price}")
+                logger.info(f"📊 Otrzymano nową cenę dla {product_id}: {price}")
+                logger.info(f"📈 Historia cen dla {product_id}: {len(market_data[product_id]['price_history'])} punktów")
             
         elif data['type'] == 'snapshot':
             product_id = data.get('product_id')
@@ -105,7 +107,9 @@ def on_ws_message(data):
                 
             market_data[product_id]['order_book']['bids'] = data.get('bids', [])
             market_data[product_id]['order_book']['asks'] = data.get('asks', [])
-            logging.info(f"Zaktualizowano książkę zleceń dla {product_id}")
+            logger.info(f"📚 Zaktualizowano książkę zleceń dla {product_id}")
+            logger.info(f"📊 Liczba bidów: {len(market_data[product_id]['order_book']['bids'])}")
+            logger.info(f"📊 Liczba asków: {len(market_data[product_id]['order_book']['asks'])}")
             
         elif data['type'] == 'l2update':
             product_id = data.get('product_id')
@@ -126,40 +130,136 @@ def on_ws_message(data):
             
             market_data[product_id]['order_book']['bids'].sort(key=lambda x: float(x[0]), reverse=True)
             market_data[product_id]['order_book']['asks'].sort(key=lambda x: float(x[0]))
+            logger.info(f"📈 Zaktualizowano L2 dla {product_id}")
             
     except Exception as e:
-        logging.error(f"Błąd podczas przetwarzania wiadomości WebSocket: {e}")
+        logger.error(f"❌ Błąd podczas przetwarzania wiadomości WebSocket: {e}")
+
+# Inicjalizacja WebSocket dla wszystkich par
+ws = CoinbaseWebSocket(API_KEY, API_SECRET, TRADING_PAIRS, callback=on_ws_message)
 
 def should_trade(current_price, historical_data):
-    """Sprawdza czy należy wykonać transakcję na podstawie wskaźników technicznych."""
+    """Uproszczona strategia handlowa oparta na podstawowych sygnałach."""
     try:
-        df = pd.DataFrame(historical_data)
-        rsi = calculate_rsi(df['price'].values)
-        macd, macd_signal, macd_hist = calculate_macd(df['price'].values)
-        ma_short, ma_long = calculate_moving_averages(df['price'].values)
+        logger.info("\n=== WEJŚCIE DO FUNKCJI SHOULD_TRADE ===")
+        logger.info(f"Typ danych historycznych: {type(historical_data)}")
+        logger.info(f"Liczba punktów danych: {len(historical_data) if isinstance(historical_data, list) else 'nie lista'}")
         
-        if rsi is None or macd is None or macd_signal is None or ma_short is None or ma_long is None:
+        logger.info("\n=== ROZPOCZYNAM ANALIZĘ WARUNKÓW HANDLOWYCH ===")
+        
+        # Walidacja danych wejściowych
+        if not isinstance(historical_data, (list, pd.DataFrame)):
+            logger.error("❌ Nieprawidłowy format danych historycznych")
             return False
             
-        last_price = float(df['price'].iloc[-1])
-        prev_price = float(df['price'].iloc[-2])
+        if isinstance(historical_data, list):
+            if not all(isinstance(x, dict) and 'price' in x for x in historical_data):
+                logger.error("❌ Nieprawidłowy format danych cenowych")
+                return False
+            df = pd.DataFrame(historical_data)
+        else:
+            df = historical_data
+            
+        if 'price' not in df.columns:
+            logger.error("❌ Brak kolumny 'price' w danych")
+            return False
+            
+        logger.info(f"Liczba punktów danych: {len(df)}")
         
-        if last_price > prev_price:
-            if 30 <= rsi <= 70:
-                if macd > 0:
-                    if macd > macd_signal:
-                        if (macd - macd_signal) > 0:
-                            return True
-        return False
-        
+        if len(df) < 20:
+            logger.info("❌ Za mało danych historycznych (minimum 20 punktów)")
+            return False
+
+        try:
+            # Konwersja i walidacja danych liczbowych
+            df['price'] = pd.to_numeric(df['price'], errors='coerce')
+            if df['price'].isnull().any():
+                logger.error("❌ Wykryto nieprawidłowe wartości cenowe")
+                return False
+                
+            last_price = float(df['price'].iloc[-1])
+            prev_price = float(df['price'].iloc[-2])
+            
+            if last_price <= 0 or prev_price <= 0:
+                logger.error("❌ Wykryto nieprawidłowe wartości cenowe (cena <= 0)")
+                return False
+                
+            price_change = ((last_price - prev_price) / prev_price) * 100
+            
+            # Oblicz średnią kroczącą z obsługą błędów
+            try:
+                ma20 = df['price'].rolling(window=20).mean().iloc[-1]
+                if pd.isna(ma20):
+                    logger.error("❌ Nie można obliczyć MA20 - brak wystarczających danych")
+                    return False
+            except Exception as e:
+                logger.error(f"❌ Błąd podczas obliczania MA20: {e}")
+                return False
+            
+            # Analiza wolumenu
+            volume_data = False
+            if 'volume' in df.columns:
+                try:
+                    df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+                    if df['volume'].isnull().any():
+                        logger.warning("⚠️ Wykryto nieprawidłowe wartości wolumenu")
+                        volume_increase = True
+                    else:
+                        volume = float(df['volume'].iloc[-1])
+                        avg_volume = float(df['volume'].rolling(window=20).mean().iloc[-1])
+                        volume_increase = volume > avg_volume * 1.5
+                        volume_data = True
+                        logger.info(f"Wolumen: {volume:.2f} (średnia: {avg_volume:.2f})")
+                except Exception as e:
+                    logger.warning(f"⚠️ Błąd podczas analizy wolumenu: {e}")
+                    volume_increase = True
+            else:
+                volume_increase = True
+                logger.info("ℹ️ Brak danych o wolumenie")
+            
+            logger.info(f"\nWskaźniki cenowe:")
+            logger.info(f"Aktualna cena: {last_price:.2f}")
+            logger.info(f"Poprzednia cena: {prev_price:.2f}")
+            logger.info(f"Zmiana ceny: {price_change:.2f}%")
+            logger.info(f"MA20: {ma20:.2f}")
+            
+            # Warunki handlowe
+            price_above_ma = last_price > ma20
+            price_momentum = price_change > 0.1
+            
+            logger.info(f"\nWarunki handlowe:")
+            logger.info(f"Cena powyżej MA20: {'✅' if price_above_ma else '❌'}")
+            logger.info(f"Pozytywny momentum: {'✅' if price_momentum else '❌'}")
+            if volume_data:
+                logger.info(f"Wzrost wolumenu: {'✅' if volume_increase else '❌'}")
+            
+            # Sygnał do handlu
+            if price_above_ma and price_momentum:
+                logger.info("\n🎯 SYGNAŁ DO HANDLU - spełnione warunki:")
+                logger.info(f"- Cena ({last_price:.2f}) > MA20 ({ma20:.2f})")
+                logger.info(f"- Momentum: {price_change:.2f}%")
+                return True
+            else:
+                logger.info("\n❌ BRAK SYGNAŁU DO HANDLU")
+                if not price_above_ma:
+                    logger.info(f"- Cena ({last_price:.2f}) poniżej MA20 ({ma20:.2f})")
+                if not price_momentum:
+                    logger.info(f"- Momentum ({price_change:.2f}%) zbyt słaby")
+                return False
+                
+        except Exception as e:
+            logger.error(f"❌ Błąd podczas analizy danych: {e}")
+            return False
+            
     except Exception as e:
-        logger.error(f"Błąd podczas analizy warunków handlowych: {e}")
+        logger.error(f"❌ Krytyczny błąd w funkcji should_trade: {e}")
         return False
 
 def analyze_market_trend(historical_data):
     """Analizuj trend rynkowy."""
     try:
         if historical_data is None or (isinstance(historical_data, pd.DataFrame) and historical_data.empty) or len(historical_data) < 24:
+            logger.warning("Niewystarczająca ilość danych do analizy trendu")
             return "neutral"
     
         if isinstance(historical_data, pd.DataFrame):
@@ -168,13 +268,20 @@ def analyze_market_trend(historical_data):
             prices = np.array(historical_data)
             
         if len(prices) == 0:
+            logger.warning("Brak danych cenowych")
             return "neutral"
             
         current_price = float(prices[-1])
         ma_short, ma_long = calculate_moving_averages(prices)
         rsi = calculate_rsi(prices)
         
+        logger.info(f"Analiza trendu:")
+        logger.info(f"Aktualna cena: {current_price}")
+        logger.info(f"MA Short: {ma_short}, MA Long: {ma_long}")
+        logger.info(f"RSI: {rsi}")
+        
         if ma_short is None or ma_long is None or rsi is None:
+            logger.warning("Brak wystarczających danych do analizy trendu")
             return "neutral"
         
         ma_short = float(ma_short)
@@ -185,10 +292,13 @@ def analyze_market_trend(historical_data):
         trend_bearish = current_price < ma_short and ma_short < ma_long and rsi < 50
         
         if trend_bullish:
+            logger.info("Wykryto trend wzrostowy")
             return "bullish"
         elif trend_bearish:
+            logger.info("Wykryto trend spadkowy")
             return "bearish"
         else:
+            logger.info("Wykryto trend neutralny")
             return "neutral"
             
     except Exception as e:
@@ -270,31 +380,151 @@ def check_all_limits(product_id):
     """Tymczasowa funkcja: zawsze zwraca True."""
     return True
 
+def calculate_rsi(prices, period=14):
+    """Oblicza wskaźnik RSI."""
+    try:
+        deltas = np.diff(prices)
+        seed = deltas[:period+1]
+        up = seed[seed >= 0].sum()/period
+        down = -seed[seed < 0].sum()/period
+        rs = up/down if down != 0 else 0
+        rsi = np.zeros_like(prices)
+        rsi[:period] = 100. - 100./(1. + rs)
+
+        for i in range(period, len(prices)):
+            delta = deltas[i - 1]
+            if delta > 0:
+                upval = delta
+                downval = 0.
+            else:
+                upval = 0.
+                downval = -delta
+
+            up = (up * (period - 1) + upval) / period
+            down = (down * (period - 1) + downval) / period
+            rs = up/down if down != 0 else 0
+            rsi[i] = 100. - 100./(1. + rs)
+
+        return rsi[-1]
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania RSI: {e}")
+        return None
+
+def calculate_macd(prices, fast=12, slow=26, signal=9):
+    """Oblicza wskaźnik MACD."""
+    try:
+        exp1 = pd.Series(prices).ewm(span=fast, adjust=False).mean()
+        exp2 = pd.Series(prices).ewm(span=slow, adjust=False).mean()
+        macd = exp1 - exp2
+        signal_line = macd.ewm(span=signal, adjust=False).mean()
+        histogram = macd - signal_line
+        return macd.iloc[-1], signal_line.iloc[-1], histogram.iloc[-1]
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania MACD: {e}")
+        return None, None, None
+
+def calculate_moving_averages(prices, short_period=20, long_period=50):
+    """Oblicza średnie kroczące."""
+    try:
+        short_ma = pd.Series(prices).rolling(window=short_period).mean()
+        long_ma = pd.Series(prices).rolling(window=long_period).mean()
+        return short_ma.iloc[-1], long_ma.iloc[-1]
+    except Exception as e:
+        logger.error(f"Błąd podczas obliczania średnich kroczących: {e}")
+        return None, None
+
 def main():
     """Główna funkcja bota."""
     try:
-        logger.info("Uruchamianie bota...")
-        ws_client = CoinbaseWebSocket(API_KEY, API_SECRET, TRADING_PAIRS)
-        ws_client.connect()
+        logger.info("🚀 Uruchamianie bota...")
+        
+        # Inicjalizacja danych dla każdej pary
+        for pair in TRADING_PAIRS:
+            logger.info(f"📊 Inicjalizacja danych dla {pair}")
+            market_data[pair] = {
+                'current_price': None,
+                'order_book': {'bids': [], 'asks': []},
+                'last_trade': None,
+                'price_history': [],
+                'last_buy_price': None,
+                'last_sell_price': None,
+                'trade_history': [],
+                'highest_price': None
+            }
+        
+        # Sprawdzenie połączenia z API
+        try:
+            ws_client = CoinbaseWebSocket(API_KEY, API_SECRET, TRADING_PAIRS)
+            ws_client.connect()
+            logger.info("✅ Połączenie z WebSocket nawiązane")
+        except Exception as e:
+            logger.error(f"❌ Błąd podczas łączenia z WebSocket: {e}")
+            return
         
         while True:
             try:
                 for product_id in TRADING_PAIRS:
-                    if check_all_conditions(product_id):
-                        logger.info(f"Warunki spełnione dla {product_id}")
+                    logger.info(f"\n{'='*50}")
+                    logger.info(f"🔍 ANALIZA {product_id}")
+                    logger.info(f"{'='*50}")
+                    
+                    # Sprawdzenie dostępności danych
+                    if product_id not in market_data:
+                        logger.error(f"❌ Brak danych dla {product_id}")
+                        continue
+                        
+                    if market_data[product_id]['current_price'] is None:
+                        logger.info(f"⏳ Oczekiwanie na dane dla {product_id}")
+                        continue
+                        
+                    current_price = market_data[product_id]['current_price']
+                    historical_data = market_data[product_id]['price_history']
+                    
+                    logger.info(f"📊 Stan danych:")
+                    logger.info(f"- Aktualna cena: {current_price}")
+                    logger.info(f"- Liczba punktów w historii: {len(historical_data)}")
+                    if len(historical_data) > 0:
+                        logger.info(f"- Ostatnia cena w historii: {historical_data[-1]['price']}")
+                        logger.info(f"- Timestamp ostatniej ceny: {historical_data[-1]['timestamp']}")
+                    
+                    # Walidacja danych historycznych
+                    if not isinstance(historical_data, list):
+                        logger.error(f"❌ Nieprawidłowy format danych historycznych dla {product_id}")
+                        continue
+                        
+                    if len(historical_data) >= 20:
+                        try:
+                            logger.info(f"📈 Rozpoczynam analizę warunków handlowych...")
+                            should_trade_result = should_trade(current_price, historical_data)
+                            if should_trade_result:
+                                logger.info(f"🎯 Wykryto sygnał do handlu dla {product_id}!")
+                                # TODO: Implementacja wykonania zlecenia
+                            else:
+                                logger.info(f"⏳ Oczekiwanie na lepsze warunki dla {product_id}")
+                        except Exception as e:
+                            logger.error(f"❌ Błąd podczas analizy {product_id}: {e}")
+                    else:
+                        logger.info(f"📊 Zbieranie danych dla {product_id}... ({len(historical_data)}/20)")
                 
+                logger.info(f"\n⏳ Oczekiwanie {TRADE_INTERVAL} sekund przed następną analizą...")
                 time.sleep(TRADE_INTERVAL)
                 
             except Exception as e:
-                logger.error(f"Błąd w głównej pętli: {e}")
+                logger.error(f"❌ Błąd w głównej pętli: {e}")
                 time.sleep(TRADE_INTERVAL)
                 
     except KeyboardInterrupt:
-        logger.info("Zatrzymywanie bota...")
-        ws_client.disconnect()
+        logger.info("🛑 Zatrzymywanie bota...")
+        try:
+            ws_client.disconnect()
+        except:
+            pass
     except Exception as e:
-        logger.error(f"Krytyczny błąd: {e}")
-        ws_client.disconnect()
+        logger.error(f"❌ Krytyczny błąd: {e}")
+        try:
+            ws_client.disconnect()
+        except:
+            pass
 
 if __name__ == "__main__":
     main() 
