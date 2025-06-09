@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import hmac
 import base64
 import ssl
+import traceback
 
 class CoinbaseWebSocket:
     def __init__(self, api_key, api_secret, trading_pairs, callback=None):
@@ -47,7 +48,7 @@ class CoinbaseWebSocket:
         # Konfiguracja logowania
         logging.basicConfig(
             filename='websocket.log',
-            level=logging.INFO,
+            level=logging.DEBUG,
             format='%(asctime)s - %(levelname)s - %(message)s'
         )
         
@@ -72,7 +73,7 @@ class CoinbaseWebSocket:
                 'last_trade': None,
                 'ticker': None
             }
-            logging.info(f"Zainicjalizowano monitoring dla pary {product_id}")
+            logging.debug(f"Zainicjalizowano monitoring dla pary {product_id}")
     
     def _get_signature(self, timestamp, method, request_path, body=''):
         message = f"{timestamp}{method}{request_path}{body}"
@@ -134,6 +135,16 @@ class CoinbaseWebSocket:
     def connect(self):
         """Nawiązanie połączenia WebSocket"""
         try:
+            logging.info(f"Próba połączenia z {self.WS_API_URL}")
+            logging.info(f"Używam klucza API: {self.api_key[:20]}...")
+            
+            # Zamknij istniejące połączenie jeśli istnieje
+            if self.ws:
+                try:
+                    self.ws.close()
+                except:
+                    pass
+            
             self.ws = websocket.WebSocketApp(
                 self.WS_API_URL,
                 on_message=self._on_message,
@@ -141,9 +152,19 @@ class CoinbaseWebSocket:
                 on_close=self._on_close,
                 on_open=self._on_open
             )
-            self.ws.run_forever()
+            
+            logging.info("Inicjalizacja WebSocketApp zakończona")
+            logging.info("Rozpoczynam pętlę WebSocket...")
+            
+            # Uruchom w osobnym wątku
+            self.ws_thread = threading.Thread(target=self.ws.run_forever, 
+                                           kwargs={"sslopt": {"cert_reqs": ssl.CERT_NONE}})
+            self.ws_thread.daemon = True
+            self.ws_thread.start()
+            
         except Exception as e:
             logging.error(f"Błąd połączenia WebSocket: {e}")
+            logging.error(f"Traceback: {traceback.format_exc()}")
             self._is_connected = False
 
     def _on_open(self, ws):
@@ -188,7 +209,22 @@ class CoinbaseWebSocket:
         logging.info("Połączenie WebSocket zamknięte")
         self._is_connected = False
         self.current_subscriptions = 0
-        self.subscription_queue = self.trading_pairs.copy()  # Przywróć kolejkę
+        
+        # Próba ponownego połączenia
+        if self.reconnect_attempts < self.max_reconnect_attempts:
+            delay = max(self.min_reconnect_delay * (2 ** self.reconnect_attempts), 5)
+            logging.info(f"Próba ponownego połączenia za {delay} sekund...")
+            time.sleep(delay)
+            self.reconnect_attempts += 1
+            self.connect()
+        else:
+            logging.error("Przekroczono maksymalną liczbę prób ponownego połączenia")
+            # Reset licznika prób co godzinę
+            if datetime.utcnow() - self.last_reconnect_reset > self.reconnect_reset_interval:
+                self.reconnect_attempts = 0
+                self.last_reconnect_reset = datetime.utcnow()
+                logging.info("Reset licznika prób ponownego połączenia")
+                self.connect()
 
     def disconnect(self):
         """Zamknięcie połączenia"""

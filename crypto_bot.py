@@ -346,7 +346,7 @@ def calculate_moving_averages(prices):
         # Konwertuj na Series jeśli to nie jest już Series
         if not isinstance(prices, pd.Series):
             prices = pd.Series(prices)
-            
+        
         # Oblicz średnie kroczące
         ma20 = prices.rolling(window=20).mean()
         ma50 = prices.rolling(window=50).mean()
@@ -465,7 +465,7 @@ def should_trade(current_price, historical_data):
                     if macd > macd_signal:
                         # Sprawdź czy MACD rośnie szybciej niż sygnał
                         if (macd - macd_signal) > 0:
-                            return True
+            return True
         return False
         
     except Exception as e:
@@ -567,7 +567,7 @@ def analyze_market_trend(historical_data):
     """Analizuj trend rynkowy."""
     try:
         if historical_data is None or (isinstance(historical_data, pd.DataFrame) and historical_data.empty) or len(historical_data) < 24:
-            return "neutral"
+        return "neutral"
     
         # Sprawdź czy historical_data jest DataFrame i konwertuj na numpy array
         if isinstance(historical_data, pd.DataFrame):
@@ -704,12 +704,12 @@ def check_total_exposure():
         total_exposure = 0
         for pair in TRADING_PAIRS:
             if pair not in market_data:
-                continue
-            
+                        continue
+                        
             trade_history = market_data[pair]['trade_history']
             if not trade_history:
-                continue
-            
+                        continue
+                        
             # Znajdź ostatnią transakcję kupna
             last_buy = None
             for trade in reversed(trade_history):
@@ -720,8 +720,8 @@ def check_total_exposure():
             if last_buy:
                 # Oblicz wartość pozycji
                 position_value = float(last_buy['amount']) * float(last_buy['price'])
-                total_exposure += position_value
-            
+                    total_exposure += position_value
+                    
         return total_exposure
         
     except Exception as e:
@@ -842,11 +842,11 @@ def should_take_profit(product_id, current_price, historical_data):
             prices = np.array(historical_data)
             
         if len(prices) == 0:
-            return False
-            
+        return False
+        
         rsi = calculate_rsi(prices)
         macd, signal, hist = calculate_macd(prices)
-        
+
         if rsi is None or macd is None or hist is None:
             return False
             
@@ -857,7 +857,7 @@ def should_take_profit(product_id, current_price, historical_data):
         if bool(price_change_percent > 0 and rsi > 70 and hist < 0):
             logging.info(f"Trend się odwraca - realizacja zysku {price_change_percent:.2f}% dla {product_id}")
             return True
-                
+            
         return False
         
     except Exception as e:
@@ -1170,7 +1170,7 @@ def check_daily_pnl():
                     # Konwertuj timestamp na datetime jeśli jest stringiem
                     if isinstance(trade['timestamp'], str):
                         trade_date = datetime.fromisoformat(trade['timestamp'].replace('Z', '+00:00')).date()
-                    else:
+        else:
                         trade_date = trade['timestamp'].date()
                         
                     if trade_date == today:
@@ -1229,7 +1229,7 @@ def check_stop_loss(product_id):
     try:
         if product_id not in market_data:
             return True
-            
+        
         # Pobierz historię transakcji
         trade_history = market_data[product_id]['trade_history']
         if not trade_history:
@@ -1312,8 +1312,8 @@ def check_take_profit(product_id):
         # Sprawdź warunki take profit
         if price_change >= TAKE_PROFIT_PERCENT:
             logger.info(f"Take profit osiągnięty: {price_change}% (limit: {TAKE_PROFIT_PERCENT}%)")
-            return True
-            
+                return True
+                
         return False
         
     except Exception as e:
@@ -1486,13 +1486,13 @@ def calculate_market_sentiment(pair):
     try:
         if pair not in market_data:
             return 0
-            
-        # Pobierz dane historyczne
-        historical_data = get_historical_data(pair)
+                        
+                        # Pobierz dane historyczne
+                        historical_data = get_historical_data(pair)
         if historical_data is None or historical_data.empty:
             return 0
-            
-        # Oblicz wskaźniki techniczne
+                        
+                        # Oblicz wskaźniki techniczne
         prices = historical_data['price'].values
         rsi = calculate_rsi(prices)
         macd, signal, hist = calculate_macd(prices)
@@ -1523,8 +1523,8 @@ def calculate_market_sentiment(pair):
             sentiment -= 1
             
         return sentiment / 3  # Normalizacja do zakresu [-1, 1]
-        
-    except Exception as e:
+                
+            except Exception as e:
         logger.error(f"Błąd podczas obliczania sentymentu rynkowego: {e}")
         return 0
 
@@ -1541,10 +1541,10 @@ def main():
         logger.error(f'Krytyczny błąd: {e}')
     finally:
         ws.disconnect()
-
+        
 if __name__ == "__main__":
     try:
-        main()
+    main()
     except Exception as e:
         logger.error(f"Krytyczny błąd: {str(e)}")
         raise

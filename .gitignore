@@ -10,11 +10,28 @@ bot_output.log
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
 
 # Środowisko wirtualne
 venv/
-env/
-.env/
+ENV/
 
 # Pliki systemowe
 .DS_Store
@@ -24,4 +41,27 @@ Thumbs.db
 account_ids.txt
 
 # Ignoruj pliki środowiskowe (np. production.env, .env)
-production.env 
+production.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Bot specific
+bot.lock
+nohup.out
+*.log
+logs/
+.env
+
+# Model files
+models/*.h5
+models/*.json
+
+# Data files
+data/*.json
+
+# Jupyter Notebook
+.ipynb_checkpoints 

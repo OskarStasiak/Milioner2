@@ -1,9 +1,11 @@
 import os
 import time
 import logging
-import fcntl
 import sys
 from crypto_bot_ai import CryptoBotAI
+from dotenv import load_dotenv
+
+load_dotenv("production.env")
 
 def setup_logging():
     """Konfiguracja systemu logowania"""
@@ -14,7 +16,7 @@ def setup_logging():
         level=logging.INFO,
         format='%(asctime)s - %(levelname)s - %(message)s',
         handlers=[
-            logging.FileHandler('logs/run_bot.log'),
+            logging.FileHandler('logs/run_bot_continuous.log'),
             logging.StreamHandler()
         ]
     )
@@ -22,12 +24,13 @@ def setup_logging():
 def main():
     """Główna funkcja uruchamiająca bot"""
     # Sprawdź czy bot nie jest już uruchomiony
-    lock_file = open('bot.lock', 'w')
-    try:
-        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except IOError:
+    if os.path.exists('bot.lock'):
         print("Bot jest już uruchomiony!")
         sys.exit(1)
+    
+    # Utwórz plik blokady
+    with open('bot.lock', 'w') as f:
+        f.write(str(os.getpid()))
 
     setup_logging()
     logger = logging.getLogger(__name__)
@@ -102,9 +105,7 @@ def main():
         if 'bot' in locals():
             bot.stop_bot()
         logger.info("Bot zatrzymany")
-        # Zwolnij blokadę
-        fcntl.flock(lock_file, fcntl.LOCK_UN)
-        lock_file.close()
+        # Usuń plik blokady
         try:
             os.remove('bot.lock')
         except:
