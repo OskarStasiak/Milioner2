@@ -25,20 +25,24 @@ class CoinbaseWebSocket:
         self.api_key = api_key
         self.api_secret = api_secret
         self.trading_pairs = trading_pairs
-        self.callback = callback  # Dodajemy callback
+        self.callback = callback
         self.ws = None
-        self.connected = False
-        self.subscribed_channels = set()  # Zbiór subskrybowanych kanałów
+        self._is_connected = False
+        self.subscription_queue = trading_pairs.copy()  # Inicjalizacja kolejki subskrypcji
+        self.max_subscriptions = 3  # Maksymalna liczba równoczesnych subskrypcji
+        self.current_subscriptions = 0
         self.last_reconnect_time = 0
         self.reconnect_attempts = 0
-        self.max_reconnect_attempts = 5
-        self.min_reconnect_delay = 5  # Zmniejszone opóźnienie między próbami połączenia
+        self.max_reconnect_attempts = 20
+        self.min_reconnect_delay = 5
         self.last_message_time = None
         self.message_count = 0
         self.last_ping = None
         self.last_pong = None
         self.reconnect_timer = None
         self.connection_lock = threading.Lock()
+        self.last_reconnect_reset = datetime.utcnow()  # Czas ostatniego resetu
+        self.reconnect_reset_interval = timedelta(hours=1)  # Reset co godzinę
         
         # Konfiguracja logowania
         logging.basicConfig(
@@ -58,7 +62,7 @@ class CoinbaseWebSocket:
             "candles": "candles",
         }
         
-        self.WS_API_URL = "wss://advanced-trade-ws.coinbase.com"
+        self.WS_API_URL = "wss://ws-feed.exchange.coinbase.com"
         
         # Słownik do przechowywania danych dla każdej pary
         self.market_data = {}
@@ -68,6 +72,7 @@ class CoinbaseWebSocket:
                 'last_trade': None,
                 'ticker': None
             }
+            logging.info(f"Zainicjalizowano monitoring dla pary {product_id}")
     
     def _get_signature(self, timestamp, method, request_path, body=''):
         message = f"{timestamp}{method}{request_path}{body}"
@@ -121,258 +126,78 @@ class CoinbaseWebSocket:
             logging.error(f"Błąd podczas generowania JWT tokena: {str(e)}")
             return None
     
-    def on_message(self, ws, message):
-        """Obsługa wiadomości WebSocket."""
+    @property
+    def is_connected(self):
+        """Sprawdza czy połączenie jest aktywne."""
+        return self._is_connected and self.ws and self.ws.sock and self.ws.sock.connected
+
+    def connect(self):
+        """Nawiązanie połączenia WebSocket"""
+        try:
+            self.ws = websocket.WebSocketApp(
+                self.WS_API_URL,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+                on_open=self._on_open
+            )
+            self.ws.run_forever()
+        except Exception as e:
+            logging.error(f"Błąd połączenia WebSocket: {e}")
+            self._is_connected = False
+
+    def _on_open(self, ws):
+        """Obsługa otwarcia połączenia"""
+        self._is_connected = True
+        logging.info("Połączenie WebSocket otwarte")
+        try:
+            # Subskrybuj wszystkie pary jednocześnie
+            subscribe_message = {
+                "type": "subscribe",
+                "product_ids": self.trading_pairs,
+                "channels": ["ticker"]
+            }
+            self.ws.send(json.dumps(subscribe_message))
+            logging.info(f"Subskrybowano wszystkie pary: {self.trading_pairs}")
+        except Exception as e:
+            logging.error(f"Błąd subskrypcji: {e}")
+            self._is_connected = False
+
+    def _on_message(self, ws, message):
+        """Obsługa otrzymanych wiadomości"""
         try:
             data = json.loads(message)
-            logging.info(f"Otrzymano wiadomość: {json.dumps(data, indent=2)}")
-            self.message_count += 1
-            self.last_message_time = datetime.utcnow()
             
-            # Obsługa ping/pong
-            if data.get('type') == 'ping':
-                self.last_ping = datetime.utcnow()
-                ws.send(json.dumps({'type': 'pong'}))
-                return
+            if data.get('type') == 'subscriptions':
+                logging.info(f"Potwierdzono subskrypcję: {data}")
+            elif data.get('type') == 'error':
+                logging.error(f"Błąd WebSocket: {data}")
+            elif data.get('type') == 'ticker' and self.callback:
+                self.callback(message)
                 
-            if data.get('type') == 'pong':
-                self.last_pong = datetime.utcnow()
-                return
-            
-            # Obsługa różnych typów wiadomości
-            if 'channel' in data:
-                channel = data['channel']
-                if channel == 'level2':
-                    self._handle_level2(data)
-                elif channel == 'ticker':
-                    self._handle_ticker(data)
-                elif channel == 'market_trades':
-                    self._handle_trades(data)
-                elif channel == 'status':
-                    self._handle_status(data)
-            
         except Exception as e:
-            logging.error(f"Błąd podczas przetwarzania wiadomości WebSocket: {e}")
-    
-    def _handle_level2(self, data):
-        """Obsługa danych order book."""
-        try:
-            product_id = data.get('product_id')
-            if product_id in self.market_data:
-                if 'bids' in data:
-                    self.market_data[product_id]['order_book']['bids'] = data['bids']
-                if 'asks' in data:
-                    self.market_data[product_id]['order_book']['asks'] = data['asks']
-                logging.debug(f"Zaktualizowano order book dla {product_id}")
-                
-                # Przekaż dane do głównego bota przez callback
-                if self.callback:
-                    self.callback(data)
-                    
-        except Exception as e:
-            logging.error(f"Błąd podczas obsługi danych level2: {e}")
-    
-    def _handle_ticker(self, data):
-        """Obsługa danych ticker."""
-        try:
-            product_id = data.get('product_id')
-            if product_id in self.market_data:
-                self.market_data[product_id]['ticker'] = data
-                logging.debug(f"Zaktualizowano ticker dla {product_id}")
-                
-                # Przekaż dane do głównego bota przez callback
-                if self.callback:
-                    self.callback(data)
-                    
-        except Exception as e:
-            logging.error(f"Błąd podczas obsługi danych ticker: {e}")
-    
-    def _handle_trades(self, data):
-        """Obsługa danych o transakcjach."""
-        try:
-            product_id = data.get('product_id')
-            if product_id in self.market_data:
-                self.market_data[product_id]['last_trade'] = data
-                logging.debug(f"Zaktualizowano ostatnią transakcję dla {product_id}")
-                
-                # Przekaż dane do głównego bota przez callback
-                if self.callback:
-                    self.callback(data)
-                    
-        except Exception as e:
-            logging.error(f"Błąd podczas obsługi danych o transakcjach: {e}")
-    
-    def _handle_status(self, data):
-        """Obsługa wiadomości o statusie."""
-        try:
-            if data.get('type') == 'error':
-                logging.error(f"Błąd WebSocket: {data.get('message')}")
-            elif data.get('type') == 'subscriptions':
-                logging.info(f"Subskrypcje: {data.get('channels')}")
-        except Exception as e:
-            logging.error(f"Błąd podczas obsługi statusu: {e}")
-    
-    def on_error(self, ws, error):
-        """Obsługa błędów WebSocket."""
-        with self.connection_lock:
-            logging.error(f"Błąd WebSocket: {error}")
-            self.connected = False
-            self._schedule_reconnect()
-    
-    def on_close(self, ws, close_status_code, close_msg):
-        """Obsługa zamknięcia połączenia WebSocket."""
-        with self.connection_lock:
-            logging.info(f"Zamknięto połączenie WebSocket: {close_status_code} - {close_msg}")
-            self.connected = False
-            self.subscribed_channels.clear()
-            self._schedule_reconnect()
-    
-    def on_open(self, ws):
-        """Obsługa otwarcia połączenia WebSocket."""
-        with self.connection_lock:
-            logging.info("Otwarto połączenie WebSocket")
-            self.connected = True
-            self.reconnect_attempts = 0
-            # Subskrybuj do kanałów po otwarciu połączenia
-            self._subscribe_to_channels()
-    
-    def _subscribe_to_channels(self):
-        """Subskrybuje do kanałów WebSocket dla każdej pary handlowej."""
-        try:
-            for product_id in self.trading_pairs:
-                # Subskrybuj do kanału ticker
-                subscribe_message = {
-                    "type": "subscribe",
-                    "product_ids": [product_id],
-                    "channel": "ticker"
-                }
-                logging.info(f"Subskrybuję do kanału ticker dla {product_id}")
-                self.ws.send(json.dumps(subscribe_message))
-                time.sleep(0.2)  # Krótsze opóźnienie
+            logging.error(f"Błąd przetwarzania wiadomości: {e}")
 
-                # Subskrybuj do kanału level2
-                subscribe_message = {
-                    "type": "subscribe",
-                    "product_ids": [product_id],
-                    "channel": "level2"
-                }
-                logging.info(f"Subskrybuję do kanału level2 dla {product_id}")
-                self.ws.send(json.dumps(subscribe_message))
-                time.sleep(0.2)
+    def _on_error(self, ws, error):
+        """Obsługa błędów"""
+        logging.error(f"Błąd WebSocket: {error}")
+        self._is_connected = False
 
-                # Subskrybuj do kanału market_trades
-                subscribe_message = {
-                    "type": "subscribe",
-                    "product_ids": [product_id],
-                    "channel": "market_trades"
-                }
-                logging.info(f"Subskrybuję do kanału market_trades dla {product_id}")
-                self.ws.send(json.dumps(subscribe_message))
-                time.sleep(0.2)
+    def _on_close(self, ws, close_status_code, close_msg):
+        """Obsługa zamknięcia połączenia"""
+        logging.info("Połączenie WebSocket zamknięte")
+        self._is_connected = False
+        self.current_subscriptions = 0
+        self.subscription_queue = self.trading_pairs.copy()  # Przywróć kolejkę
 
-        except Exception as e:
-            logging.error(f"Błąd podczas subskrybowania do kanałów: {str(e)}")
-            raise
-    
-    def _run_forever(self):
-        """Uruchamia WebSocket w pętli z obsługą błędów."""
-        try:
-            self.ws.run_forever(
-                ping_interval=20,
-                ping_timeout=10,
-                ping_payload='{"type":"ping"}',
-                skip_utf8_validation=True
-            )
-        except Exception as e:
-            logging.error(f"Błąd w pętli WebSocket: {e}")
-            self.connected = False
-            self._schedule_reconnect()
-    
-    def _schedule_reconnect(self):
-        """Planuje ponowne połączenie."""
-        if self.reconnect_timer is not None:
-            self.reconnect_timer.cancel()
-        
-        delay = self.min_reconnect_delay * (2 ** min(self.reconnect_attempts, 5))
-        self.reconnect_timer = threading.Timer(delay, self._attempt_reconnect)
-        self.reconnect_timer.daemon = True
-        self.reconnect_timer.start()
-    
-    def _attempt_reconnect(self):
-        """Próbuje ponownie nawiązać połączenie."""
-        with self.connection_lock:
-            try:
-                if self.reconnect_attempts >= self.max_reconnect_attempts:
-                    logging.error("Przekroczono maksymalną liczbę prób ponownego połączenia")
-                    return
-                
-                self.reconnect_attempts += 1
-                logging.info(f"Próba ponownego połączenia {self.reconnect_attempts}/{self.max_reconnect_attempts}")
-                self.connect()
-                
-            except Exception as e:
-                logging.error(f"Błąd podczas próby ponownego połączenia: {e}")
-                self.connected = False
-                self._schedule_reconnect()
-    
-    def connect(self):
-        """Nawiązuje połączenie WebSocket."""
-        with self.connection_lock:
-            try:
-                if self.ws is not None:
-                    self.disconnect()
-                
-                # Przygotuj nagłówki
-                headers = {
-                    'User-Agent': 'Mozilla/5.0',
-                    'Origin': 'https://advanced-trade-ws.coinbase.com'
-                }
-                
-                # Utwórz połączenie WebSocket
-                websocket.enableTrace(True)
-                self.ws = websocket.WebSocketApp(
-                    self.WS_API_URL,
-                    header=headers,
-                    on_message=self.on_message,
-                    on_error=self.on_error,
-                    on_close=self.on_close,
-                    on_open=self.on_open,
-                    on_ping=self.on_ping,
-                    on_pong=self.on_pong
-                )
-                
-                # Uruchom WebSocket w osobnym wątku
-                self.ws_thread = threading.Thread(target=self._run_forever)
-                self.ws_thread.daemon = True
-                self.ws_thread.start()
-                
-                # Nie blokuj głównego wątku - pozwól na asynchroniczne połączenie
-                logging.info("Rozpoczęto łączenie z WebSocket...")
-                
-            except Exception as e:
-                logging.error(f"Błąd podczas nawiązywania połączenia WebSocket: {e}")
-                self.connected = False
-                self._schedule_reconnect()
-                raise
-    
     def disconnect(self):
-        """Zamyka połączenie WebSocket."""
-        with self.connection_lock:
-            try:
-                if self.reconnect_timer is not None:
-                    self.reconnect_timer.cancel()
-                    self.reconnect_timer = None
-                
-                if self.ws:
-                    self.ws.close()
-                    self.ws = None
-                
-                self.connected = False
-                self.subscribed_channels.clear()
-                
-            except Exception as e:
-                logging.error(f"Błąd podczas zamykania połączenia WebSocket: {e}")
-    
+        """Zamknięcie połączenia"""
+        if self.ws:
+            self.ws.close()
+            self._is_connected = False
+            self.current_subscriptions = 0
+            self.subscription_queue = self.trading_pairs.copy()
+
     def get_market_data(self, product_id):
         """Pobierz dane rynkowe dla danej pary."""
         return self.market_data.get(product_id, {})
@@ -392,7 +217,7 @@ class CoinbaseWebSocket:
     def subscribe_to_channels(self, product_id):
         """Subskrybuj do kanałów dla danej pary handlowej."""
         try:
-            if not self.connected:
+            if not self.is_connected:
                 raise Exception("Brak połączenia WebSocket")
                 
             # Pobierz nowy JWT
@@ -415,14 +240,10 @@ class CoinbaseWebSocket:
             logging.error(f"Błąd podczas subskrybowania do kanałów dla {product_id}: {e}")
             raise
 
-    def is_connected(self):
-        """Sprawdza czy połączenie jest aktywne."""
-        return self.connected and self.ws and self.ws.sock and self.ws.sock.connected
-
     def subscribe_to_ticker(self, product_id):
         """Subskrybuje do kanału ticker dla danej pary."""
         try:
-            if not self.connected or not self.ws:
+            if not self.is_connected or not self.ws:
                 logging.error("Brak połączenia WebSocket")
                 return
             
@@ -433,7 +254,7 @@ class CoinbaseWebSocket:
             }
             
             self.ws.send(json.dumps(message))
-            self.subscribed_channels.add(f"ticker_{product_id}")
+            self.subscription_queue.append(product_id)
             logging.info(f"Subskrybowano do kanału ticker dla {product_id}")
             time.sleep(0.5)  # Dodaj opóźnienie między subskrypcjami
             
@@ -444,7 +265,7 @@ class CoinbaseWebSocket:
     def subscribe_to_level2(self, product_id):
         """Subskrybuje do kanału level2 dla danej pary."""
         try:
-            if not self.connected or not self.ws:
+            if not self.is_connected or not self.ws:
                 logging.error("Brak połączenia WebSocket")
                 return
             
@@ -455,7 +276,7 @@ class CoinbaseWebSocket:
             }
             
             self.ws.send(json.dumps(message))
-            self.subscribed_channels.add(f"level2_{product_id}")
+            self.subscription_queue.append(product_id)
             logging.info(f"Subskrybowano do kanału level2 dla {product_id}")
             time.sleep(0.5)  # Dodaj opóźnienie między subskrypcjami
             
@@ -466,7 +287,7 @@ class CoinbaseWebSocket:
     def subscribe_to_market_trades(self, product_id):
         """Subskrybuje do kanału market_trades dla danej pary."""
         try:
-            if not self.connected or not self.ws:
+            if not self.is_connected or not self.ws:
                 logging.error("Brak połączenia WebSocket")
                 return
             
@@ -477,7 +298,7 @@ class CoinbaseWebSocket:
             }
             
             self.ws.send(json.dumps(message))
-            self.subscribed_channels.add(f"market_trades_{product_id}")
+            self.subscription_queue.append(product_id)
             logging.info(f"Subskrybowano do kanału market_trades dla {product_id}")
             time.sleep(0.5)  # Dodaj opóźnienie między subskrypcjami
             

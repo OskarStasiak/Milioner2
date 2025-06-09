@@ -49,17 +49,15 @@ with open('cdp_api_key.json', 'r') as f:
     API_SECRET = api_keys['api_key_secret']
 
 # Parametry handlowe
-TRADING_PAIRS = ['ETH-USD', 'BTC-USD', 'SOL-USD', 'DOGE-USD', 'XRP-USD', 'MATIC-USD', 'LINK-USD']
-TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 50))
-MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 200))
+TRADING_PAIRS = ['ETH-USD', 'BTC-USD', 'SOL-USD']
+TRADE_VALUE_USDC = float(os.getenv('TRADE_VALUE_USDC', 100))
+MAX_TOTAL_EXPOSURE = float(os.getenv('MAX_TOTAL_EXPOSURE', 500))
 MAX_POSITION_SIZE = float(os.getenv('MAX_POSITION_SIZE', 0.05))
-PRICE_THRESHOLD_BUY = float(os.getenv('PRICE_THRESHOLD_BUY', 2500))
-PRICE_THRESHOLD_SELL = float(os.getenv('PRICE_THRESHOLD_SELL', 2800))
-MIN_PROFIT_PERCENT = float(os.getenv('MIN_PROFIT_PERCENT', 0.3))
-MAX_LOSS_PERCENT = float(os.getenv('MAX_LOSS_PERCENT', 1.0))
+MIN_PROFIT_PERCENT = float(os.getenv('MIN_PROFIT_PERCENT', 0.15))
+MAX_LOSS_PERCENT = float(os.getenv('MAX_LOSS_PERCENT', 1.2))
 STOP_LOSS_PERCENT = float(os.getenv('STOP_LOSS_PERCENT', 0.8))
-TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', 1.0))
-TRAILING_STOP_PERCENT = float(os.getenv('TRAILING_STOP_PERCENT', 0.3))
+TAKE_PROFIT_PERCENT = float(os.getenv('TAKE_PROFIT_PERCENT', 0.6))
+TRAILING_STOP_PERCENT = float(os.getenv('TRAILING_STOP_PERCENT', 0.4))
 TRADE_INTERVAL = int(os.getenv('TRADE_INTERVAL', 30))
 
 # Inicjalizacja API
@@ -138,16 +136,37 @@ def on_ws_message(data):
 # Inicjalizacja WebSocket dla wszystkich par
 ws = CoinbaseWebSocket(API_KEY, API_SECRET, TRADING_PAIRS, callback=on_ws_message)
 
+def calculate_rsi(prices, period=14):
+    """Oblicza wskaźnik RSI."""
+    deltas = np.diff(prices)
+    seed = deltas[:period+1]
+    up = seed[seed >= 0].sum()/period
+    down = -seed[seed < 0].sum()/period
+    rs = up/down
+    rsi = np.zeros_like(prices)
+    rsi[:period] = 100. - 100./(1.+rs)
+
+    for i in range(period, len(prices)):
+        delta = deltas[i-1]
+        if delta > 0:
+            upval = delta
+            downval = 0.
+        else:
+            upval = 0.
+            downval = -delta
+
+        up = (up*(period-1) + upval)/period
+        down = (down*(period-1) + downval)/period
+        rs = up/down
+        rsi[i] = 100. - 100./(1.+rs)
+
+    return rsi
+
 def should_trade(current_price, historical_data):
-    """Uproszczona strategia handlowa oparta na podstawowych sygnałach."""
+    """Ulepszona strategia handlowa z lepszą analizą trendu."""
     try:
         logger.info("\n=== WEJŚCIE DO FUNKCJI SHOULD_TRADE ===")
-        logger.info(f"Typ danych historycznych: {type(historical_data)}")
-        logger.info(f"Liczba punktów danych: {len(historical_data) if isinstance(historical_data, list) else 'nie lista'}")
         
-        logger.info("\n=== ROZPOCZYNAM ANALIZĘ WARUNKÓW HANDLOWYCH ===")
-        
-        # Walidacja danych wejściowych
         if not isinstance(historical_data, (list, pd.DataFrame)):
             logger.error("❌ Nieprawidłowy format danych historycznych")
             return False
@@ -166,12 +185,11 @@ def should_trade(current_price, historical_data):
             
         logger.info(f"Liczba punktów danych: {len(df)}")
         
-        if len(df) < 20:
-            logger.info("❌ Za mało danych historycznych (minimum 20 punktów)")
+        if len(df) < 12:  # Zwiększamy wymaganą liczbę punktów
+            logger.info("❌ Za mało danych historycznych (minimum 12 punktów)")
             return False
 
         try:
-            # Konwersja i walidacja danych liczbowych
             df['price'] = pd.to_numeric(df['price'], errors='coerce')
             if df['price'].isnull().any():
                 logger.error("❌ Wykryto nieprawidłowe wartości cenowe")
@@ -186,14 +204,16 @@ def should_trade(current_price, historical_data):
                 
             price_change = ((last_price - prev_price) / prev_price) * 100
             
-            # Oblicz średnią kroczącą z obsługą błędów
+            # Oblicz średnie kroczące
             try:
+                ma8 = df['price'].rolling(window=8).mean().iloc[-1]
                 ma20 = df['price'].rolling(window=20).mean().iloc[-1]
-                if pd.isna(ma20):
-                    logger.error("❌ Nie można obliczyć MA20 - brak wystarczających danych")
+                ma50 = df['price'].rolling(window=50).mean().iloc[-1]
+                if pd.isna(ma8) or pd.isna(ma20) or pd.isna(ma50):
+                    logger.error("❌ Nie można obliczyć średnich kroczących")
                     return False
             except Exception as e:
-                logger.error(f"❌ Błąd podczas obliczania MA20: {e}")
+                logger.error(f"❌ Błąd podczas obliczania średnich kroczących: {e}")
                 return False
             
             # Analiza wolumenu
@@ -206,8 +226,8 @@ def should_trade(current_price, historical_data):
                         volume_increase = True
                     else:
                         volume = float(df['volume'].iloc[-1])
-                        avg_volume = float(df['volume'].rolling(window=20).mean().iloc[-1])
-                        volume_increase = volume > avg_volume * 1.5
+                        avg_volume = float(df['volume'].rolling(window=12).mean().iloc[-1])
+                        volume_increase = volume > avg_volume * 1.15  # Zwiększamy wymagany wzrost wolumenu
                         volume_data = True
                         logger.info(f"Wolumen: {volume:.2f} (średnia: {avg_volume:.2f})")
                 except Exception as e:
@@ -221,30 +241,47 @@ def should_trade(current_price, historical_data):
             logger.info(f"Aktualna cena: {last_price:.2f}")
             logger.info(f"Poprzednia cena: {prev_price:.2f}")
             logger.info(f"Zmiana ceny: {price_change:.2f}%")
+            logger.info(f"MA8: {ma8:.2f}")
             logger.info(f"MA20: {ma20:.2f}")
+            logger.info(f"MA50: {ma50:.2f}")
             
-            # Warunki handlowe
-            price_above_ma = last_price > ma20
-            price_momentum = price_change > 0.1
+            # Ulepszone warunki handlowe
+            price_above_ma = last_price > ma8 * 0.995  # Zwiększamy tolerancję
+            price_momentum = price_change > 0.02  # Zmniejszamy wymagany momentum
+            ma_trend = ma8 > ma20 and ma20 > ma50  # Sprawdzamy trend na wszystkich średnich
+            volatility_ok = abs(price_change) < 2.0  # Sprawdzamy zmienność
             
             logger.info(f"\nWarunki handlowe:")
-            logger.info(f"Cena powyżej MA20: {'✅' if price_above_ma else '❌'}")
+            logger.info(f"Cena powyżej MA8: {'✅' if price_above_ma else '❌'}")
             logger.info(f"Pozytywny momentum: {'✅' if price_momentum else '❌'}")
+            logger.info(f"Trend MA8 > MA20 > MA50: {'✅' if ma_trend else '❌'}")
+            logger.info(f"Zmienność OK: {'✅' if volatility_ok else '❌'}")
             if volume_data:
                 logger.info(f"Wzrost wolumenu: {'✅' if volume_increase else '❌'}")
             
-            # Sygnał do handlu
-            if price_above_ma and price_momentum:
+            # Sygnał do handlu - wymagamy 3 z 4 warunków
+            conditions_met = sum([price_above_ma, price_momentum, ma_trend, volatility_ok])
+            if conditions_met >= 3:
                 logger.info("\n🎯 SYGNAŁ DO HANDLU - spełnione warunki:")
-                logger.info(f"- Cena ({last_price:.2f}) > MA20 ({ma20:.2f})")
-                logger.info(f"- Momentum: {price_change:.2f}%")
+                if price_above_ma:
+                    logger.info(f"- Cena ({last_price:.2f}) > MA8 ({ma8:.2f})")
+                if price_momentum:
+                    logger.info(f"- Momentum: {price_change:.2f}%")
+                if ma_trend:
+                    logger.info(f"- Trend MA8 > MA20 > MA50")
+                if volatility_ok:
+                    logger.info(f"- Zmienność OK: {abs(price_change):.2f}%")
                 return True
             else:
                 logger.info("\n❌ BRAK SYGNAŁU DO HANDLU")
                 if not price_above_ma:
-                    logger.info(f"- Cena ({last_price:.2f}) poniżej MA20 ({ma20:.2f})")
+                    logger.info(f"- Cena ({last_price:.2f}) poniżej MA8 ({ma8:.2f})")
                 if not price_momentum:
                     logger.info(f"- Momentum ({price_change:.2f}%) zbyt słaby")
+                if not ma_trend:
+                    logger.info(f"- Trend nie potwierdzony")
+                if not volatility_ok:
+                    logger.info(f"- Zmienność zbyt wysoka: {abs(price_change):.2f}%")
                 return False
                 
         except Exception as e:
@@ -278,7 +315,7 @@ def analyze_market_trend(historical_data):
         logger.info(f"Analiza trendu:")
         logger.info(f"Aktualna cena: {current_price}")
         logger.info(f"MA Short: {ma_short}, MA Long: {ma_long}")
-        logger.info(f"RSI: {rsi}")
+        logger.info(f"RSI: {rsi[-1]:.2f}")
         
         if ma_short is None or ma_long is None or rsi is None:
             logger.warning("Brak wystarczających danych do analizy trendu")
@@ -286,7 +323,7 @@ def analyze_market_trend(historical_data):
         
         ma_short = float(ma_short)
         ma_long = float(ma_long)
-        rsi = float(rsi)
+        rsi = float(rsi[-1])
         
         trend_bullish = current_price > ma_short and ma_short > ma_long and rsi > 50
         trend_bearish = current_price < ma_short and ma_short < ma_long and rsi < 50
@@ -379,36 +416,6 @@ def check_trailing_stop(product_id):
 def check_all_limits(product_id):
     """Tymczasowa funkcja: zawsze zwraca True."""
     return True
-
-def calculate_rsi(prices, period=14):
-    """Oblicza wskaźnik RSI."""
-    try:
-        deltas = np.diff(prices)
-        seed = deltas[:period+1]
-        up = seed[seed >= 0].sum()/period
-        down = -seed[seed < 0].sum()/period
-        rs = up/down if down != 0 else 0
-        rsi = np.zeros_like(prices)
-        rsi[:period] = 100. - 100./(1. + rs)
-
-        for i in range(period, len(prices)):
-            delta = deltas[i - 1]
-            if delta > 0:
-                upval = delta
-                downval = 0.
-            else:
-                upval = 0.
-                downval = -delta
-
-            up = (up * (period - 1) + upval) / period
-            down = (down * (period - 1) + downval) / period
-            rs = up/down if down != 0 else 0
-            rsi[i] = 100. - 100./(1. + rs)
-
-        return rsi[-1]
-    except Exception as e:
-        logger.error(f"Błąd podczas obliczania RSI: {e}")
-        return None
 
 def calculate_macd(prices, fast=12, slow=26, signal=9):
     """Oblicza wskaźnik MACD."""
